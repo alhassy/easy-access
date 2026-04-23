@@ -1,7 +1,7 @@
 ;;; easy-access.el --- Clojure-style keyword/integer accessors  -*- lexical-binding: t; -*-
 
 ;; Author: Musa Al-hassy
-;; Version: 0.4.0
+;; Version: 0.5.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: lisp, tools, extensions
 
