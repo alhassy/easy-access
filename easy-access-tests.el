@@ -855,18 +855,26 @@ anything registered after its initial definition."
 
 (ert-deftest easy-access/defcall-read-key ()
   "A `:read-key' canonicaliser reshapes HEAD before the rule body
-sees it.  The built-in `quoted-symbols-as-accessors' uses
-`:read-key cadr' to strip the `(quote ...)' wrapper -- we exercise
-the same mechanism with a user rule.  `[[foo]]' CARs are bracketed
-symbols unwrapped to plain symbols."
+sees it.  We exercise this with a user rule that wraps `bracket':
+`(bracket SYM)' CARs are bracketed symbols unwrapped to plain
+symbols.  The `:read-key' validates structure (must be exactly
+`(bracket SYM)') before extracting, and the `:when' tests the
+resulting canonical symbol."
   (easy-access-tests--with-mode
     (easy-access-tests--with-rule bracketed-symbol
       (eval
        '(defcall bracketed-symbol (head target &optional value)
-          :when (and (listp head)
-                     (eq (car-safe head) 'bracket)
-                     (symbolp (cadr head)))
-          :read-key cadr                 ; strip the (bracket ...) wrapper
+          :when (and (symbolp head) (not (keywordp head))
+                     (not (null head)) (not (eq head t)))
+          :read-key (lambda (form)
+                      (unless (and (consp form)
+                                   (eq (car form) 'bracket)
+                                   (consp (cdr form))
+                                   (null (cddr form))
+                                   (symbolp (cadr form)))
+                        (signal 'wrong-type-argument
+                                (list 'bracketed-symbol-form form)))
+                      (cadr form))
           "Treat (bracket SYM) CARs as bare-symbol accessors on plists."
           (ignore value)
           (plist-get target head))
@@ -1247,6 +1255,38 @@ an accessor."
     (easy-access-walk
      '(cl-defmethod my-method :around ((x my-struct))
         (:name x))))))
+
+(ert-deftest easy-access/walker-cl-case-patterns ()
+  "`cl-case' match keys (integers, keywords, symbols) are data —
+the walker must not rewrite them as accessor forms."
+  (should
+   (equal
+    '(cl-case (easy-access-lookup obj :type)
+       (4 "four")
+       (:otherwise "default"))
+    (easy-access-walk
+     '(cl-case (:type obj)
+        (4 "four")
+        (:otherwise "default"))))))
+
+(ert-deftest easy-access/walker-cond-not-false-positive ()
+  "Cond clauses like ((and x y) body) and ((fn arg) body) must
+not be treated as accessor forms.  Before the `:read-key' fix,
+`cadr' of `(and x y)' returned `x' -- a symbol -- tricking the
+`quoted-symbols-as-accessors' rule into matching."
+  (should
+   (equal
+    '(cond
+      ((and very-stale large-change) "abandon")
+      ((<= total 10) 1)
+      ((work-item-urgent it) (push it urgent))
+      (t nil))
+    (easy-access-walk
+     '(cond
+        ((and very-stale large-change) "abandon")
+        ((<= total 10) 1)
+        ((work-item-urgent it) (push it urgent))
+        (t nil))))))
 
 (provide 'easy-access-tests)
 ;;; easy-access-tests.el ends here

@@ -546,7 +546,7 @@ a cons cell\" heuristic."
 (defcall quoted-symbols-as-accessors (head target &optional value)
   :when (and (symbolp head) (not (keywordp head))
              (not (null head)) (not (eq head t)))
-  :read-key cadr                          ; strip (quote SYM) -> SYM
+  :read-key easy-access--quoted-symbol-read-key ; strip (quote SYM) -> SYM
   "Quoted symbols -- (quote SYM) in CAR position -- look up by
 plain-symbol key; `setf'-able.  The `:read-key' canonicalises the
 CAR from `(quote custom-group)' to `custom-group' before it
@@ -643,6 +643,17 @@ thing."
        (null (cddr form))
        (symbolp (cadr form))
        (not (keywordp (cadr form)))))
+
+(defun easy-access--quoted-symbol-read-key (form)
+  "Extract the symbol from a `(quote SYM)' surface form.
+Signals an error if FORM is not exactly `(quote SYM)' with SYM a
+non-keyword symbol -- the `condition-case' in
+`easy-access--surface-matching-rule' catches the error and skips
+the rule.  Bare `cadr' would accept any two-or-more-element list
+\(e.g. `(and x y z)'), leading to false positives."
+  (unless (easy-access--quoted-symbol-p form)
+    (signal 'wrong-type-argument (list 'quoted-symbol-form form)))
+  (cadr form))
 
 (defun easy-access--key-atom-p (key)
   "Return non-nil if KEY is a valid accessor-key surface shape.
@@ -888,6 +899,23 @@ walking code sub-forms."
      ((eq head 'pcase-lambda)
       `(pcase-lambda ,(cadr form)
          ,@(mapcar #'easy-access-walk (cddr form))))
+     ;; cl-case / case / ecase / cl-ecase / cl-typecase / cl-etypecase:
+     ;; (cl-case EXPR (KEY BODY...) ...)
+     ;; KEY positions are literal match values (integers, keywords,
+     ;; symbols, lists of values, t, otherwise) — not code.  Walk EXPR
+     ;; and each clause's BODY, but leave KEY untouched.
+     ((memq head '(case cl-case ecase cl-ecase
+                        cl-typecase cl-etypecase))
+      `(,head ,(easy-access-walk (cadr form))
+              ,@(mapcar (lambda (clause)
+                          (cons (car clause)
+                                (mapcar #'easy-access-walk (cdr clause))))
+                        (cddr form))))
+     ;; use-package: keyword-argument plist with mixed code/data slots.
+     ;; Walking it generically would rewrite (:url "...") as an accessor.
+     ;; Expand the macro so only the resulting code forms are walked.
+     ((and (eq head 'use-package) (macrop 'use-package))
+      (easy-access-walk (macroexpand form)))
      ;; cl-defstruct: everything after the name is declarative; do not walk.
      ((eq head 'cl-defstruct) form)
      ;; Threading macros: their expansions reshape bodies in ways that
