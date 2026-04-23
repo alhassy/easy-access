@@ -615,19 +615,17 @@ same \"CAR is a cons cell\" heuristic as keywords."
   '(quote function)
   "CAR symbols whose args are data, not code -- walker skips them entirely.")
 
-(defcustom easy-access--walkable-macros
-  '(thread-first thread-last
-    ;; Dash's threading macros, expanded only if `dash' is loaded.
-    -> ->>)
-  "Macros the walker unconditionally expands one step to reveal
-accessor forms in their output.  Threading macros belong here --
-they reshape bodies in ways that can produce `(:K obj)' patterns
-only after expansion.  Add user-defined threading-style macros as
-needed.  Macros not in this list are left untouched; their bodies
-are recursively walked only where the walker already descends
-(let-bodies, defun-bodies, etc.)."
-  :type '(repeat symbol)
-  :group 'easy-access)
+(defvar easy-access--gv-macros
+  '(setf setq cl-setf psetf psetq
+    push pop cl-pushnew cl-callf cl-callf2
+    cl-letf cl-letf*
+    cl-incf cl-decf incf decf)
+  "Macros that operate on generalised variables (places).
+The walker must NOT macroexpand these — the gv machinery needs to
+see the raw `(:key obj)' accessor form to dispatch through
+`gv-define-setter'.  All other macros are safe to expand before
+walking.")
+
 
 (defun easy-access--quoted-symbol-p (form)
   "Return non-nil if FORM is `(quote SYM)' with SYM a non-keyword symbol.
@@ -911,27 +909,32 @@ walking code sub-forms."
                           (cons (car clause)
                                 (mapcar #'easy-access-walk (cdr clause))))
                         (cddr form))))
-     ;; use-package: keyword-argument plist with mixed code/data slots.
-     ;; Walking it generically would rewrite (:url "...") as an accessor.
-     ;; Expand the macro so only the resulting code forms are walked.
-     ((and (eq head 'use-package) (macrop 'use-package))
-      (easy-access-walk (macroexpand form)))
      ;; cl-defstruct: everything after the name is declarative; do not walk.
      ((eq head 'cl-defstruct) form)
-     ;; Threading macros: their expansions reshape bodies in ways that
-     ;; can reveal accessor forms only after expansion.  We use
-     ;; `macroexpand' (full, not -1) because `thread-first' in Emacs 29+
-     ;; expands in two steps via the `internal--thread-argument' helper
-     ;; -- single-step expansion leaves that helper in place, so the
-     ;; walker would never see the final nested `(:b (:a obj))' shape.
-     ;; Guard against unloaded macros: if HEAD is in our list but not
-     ;; actually bound as a macro (e.g. dash's `->' without dash loaded),
-     ;; fall through to the default walker.
-     ((and (memq head easy-access--walkable-macros)
-           (macrop head))
-      (easy-access-walk (macroexpand form)))
-     ;; Default: walk every sub-form.  Safe because the walker is a no-op
-     ;; on anything that isn't an accessor pattern.
+     ;; Keyword-plist macros: macroexpand before walking.
+     ;;
+     ;; Macros like `use-package', `define-relation', and other
+     ;; DSL-style macros accept keyword-argument plists where forms
+     ;; like `(:url "...")' or `("s1" "s2")' appear in data positions.
+     ;; Walking their sub-forms directly would misidentify these as
+     ;; accessor forms.  Macroexpansion produces standard code whose
+     ;; sub-forms are all in code position.
+     ;;
+     ;; We expand any macro EXCEPT those known to need the walker's
+     ;; raw accessor forms (e.g. `setf', `push', `cl-callf' — the
+     ;; generalized-variable machinery must see `(:key obj)' intact).
+     ;; Full `macroexpand' (not -1) for multi-step expansions.
+     ((and (symbolp head) (macrop head)
+           (not (memq head easy-access--gv-macros)))
+      (let ((expanded (condition-case nil
+                          (macroexpand form)
+                        (error nil))))
+        (if (and expanded (not (equal expanded form)))
+            (easy-access-walk expanded)
+          ;; Expansion failed or returned the same form — walk sub-forms.
+          (cons head (mapcar #'easy-access-walk (cdr form))))))
+     ;; Default: walk every sub-form for function calls and
+     ;; special forms not explicitly handled above.
      (t (cons head (mapcar #'easy-access-walk (cdr form)))))))
 
 (defun easy-access--walk-backquote (form)
