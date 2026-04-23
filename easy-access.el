@@ -612,8 +612,11 @@ same \"CAR is a cons cell\" heuristic as keywords."
 ;;; double-rewriting.
 
 (defvar easy-access--walk-skip-cars
-  '(quote function)
-  "CAR symbols whose args are data, not code -- walker skips them entirely.")
+  '(quote)
+  "CAR symbols whose args are data, not code -- walker skips them entirely.
+Note: `function' used to be here but is now handled explicitly in
+the walker to distinguish `#'SYMBOL' (data) from `#'(lambda ...)'
+(contains code).")
 
 (defvar easy-access--gv-macros
   '(setf setq cl-setf psetf psetq
@@ -806,8 +809,17 @@ binding positions, arg lists, and other data sub-forms while
 walking code sub-forms."
   (let ((head (car form)))
     (cond
-     ;; Quoted forms and function quotes: data, not code.
-     ((memq head easy-access--walk-skip-cars) form)
+     ;; Quoted forms: data, not code.
+     ((eq head 'quote) form)
+     ;; Function quotes: #'SYMBOL is data (a function reference),
+     ;; but #'(lambda ARGS BODY...) contains code in BODY that
+     ;; must be walked -- cl-flet and cl-labels expand to this shape.
+     ((eq head 'function)
+      (let ((arg (cadr form)))
+        (if (and (consp arg) (eq (car arg) 'lambda))
+            `(function (lambda ,(cadr arg)
+                         ,@(mapcar #'easy-access-walk (cddr arg))))
+          form)))
      ;; Backquote: walk the template, respecting unquotes.
      ((eq head '\`)
       (list '\` (easy-access--walk-backquote (cadr form))))
