@@ -1141,5 +1141,112 @@ at walk-time, so the walker leaves it untouched."
         (headers '(("Authorization" . "Bearer tok"))))
     (should (equal "Bearer tok" (easy-access-lookup headers key)))))
 
+;;; -------------------------------------------------------------------------
+;;; Group 18 -- Walker special-form handling
+;;; -------------------------------------------------------------------------
+;;;
+;;; The walker must skip data positions inside special forms that contain
+;;; keywords, integers, and quoted symbols as match patterns or
+;;; annotations rather than accessor keys.  Without explicit handling,
+;;; the default "walk every sub-form" clause would rewrite these data
+;;; positions into `easy-access-lookup' calls.
+
+(ert-deftest easy-access/walker-define-advice-name-spec ()
+  "`define-advice' name-specs contain :around/:before/:after keywords
+and arglist shapes -- the walker must not rewrite them as accessors.
+Only the body forms should be walked."
+  (should
+   (equal
+    '(define-advice foo (:around (orig &rest args) my-advice)
+       (easy-access-lookup bar :key))
+    (easy-access-walk
+     '(define-advice foo (:around (orig &rest args) my-advice)
+        (:key bar))))))
+
+(ert-deftest easy-access/walker-pcase-integer-pattern ()
+  "`pcase' integer patterns like (0 ...) must not become accessors.
+The walker should leave patterns untouched and only walk BODY forms."
+  (should
+   (equal
+    '(pcase x
+       (0 (easy-access-lookup items :first))
+       (1 (easy-access-lookup items :second))
+       (_ nil))
+    (easy-access-walk
+     '(pcase x
+        (0 (:first items))
+        (1 (:second items))
+        (_ nil))))))
+
+(ert-deftest easy-access/walker-pcase-quoted-symbol-pattern ()
+  "`pcase' quoted-symbol patterns like ('todo ...) must not become accessors.
+These are match-equal patterns, not function calls."
+  (should
+   (equal
+    '(pcase status
+       ('todo "do it")
+       ('done "finished"))
+    (easy-access-walk
+     '(pcase status
+        ('todo "do it")
+        ('done "finished"))))))
+
+(ert-deftest easy-access/walker-pcase-let ()
+  "`pcase-let' binding patterns are data -- only the EXPR and BODY
+should be walked."
+  (should
+   (equal
+    '(pcase-let ((`(,a ,b) (easy-access-lookup obj :pair)))
+       (easy-access-lookup a :name))
+    (easy-access-walk
+     '(pcase-let ((`(,a ,b) (:pair obj)))
+        (:name a))))))
+
+(ert-deftest easy-access/walker-pcase-let* ()
+  "`pcase-let*' binding patterns are data -- same treatment as `pcase-let'."
+  (should
+   (equal
+    '(pcase-let* ((`(,h ,m) (easy-access-lookup times :pair))
+                  (`(,x ,y) (easy-access-lookup coords :pos)))
+       (list h m x y))
+    (easy-access-walk
+     '(pcase-let* ((`(,h ,m) (:pair times))
+                   (`(,x ,y) (:pos coords)))
+        (list h m x y))))))
+
+(ert-deftest easy-access/walker-pcase-expr-is-walked ()
+  "The discriminant EXPR of `pcase' should be walked -- it IS code."
+  (should
+   (equal
+    '(pcase (easy-access-lookup obj :status)
+       ('active t)
+       (_ nil))
+    (easy-access-walk
+     '(pcase (:status obj)
+        ('active t)
+        (_ nil))))))
+
+(ert-deftest easy-access/walker-cl-defmethod ()
+  "`cl-defmethod' arglists contain type specializers that must not
+be walked.  Only the body should be walked."
+  (should
+   (equal
+    '(cl-defmethod my-method ((x my-struct))
+       (easy-access-lookup x :name))
+    (easy-access-walk
+     '(cl-defmethod my-method ((x my-struct))
+        (:name x))))))
+
+(ert-deftest easy-access/walker-cl-defmethod-qualifier ()
+  "`cl-defmethod' with :around qualifier -- the keyword must not become
+an accessor."
+  (should
+   (equal
+    '(cl-defmethod my-method :around ((x my-struct))
+       (easy-access-lookup x :name))
+    (easy-access-walk
+     '(cl-defmethod my-method :around ((x my-struct))
+        (:name x))))))
+
 (provide 'easy-access-tests)
 ;;; easy-access-tests.el ends here

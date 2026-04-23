@@ -834,6 +834,60 @@ walking code sub-forms."
      ((memq head '(defun defmacro defsubst cl-defun cl-defmacro))
       `(,head ,(cadr form) ,(caddr form)
               ,@(mapcar #'easy-access-walk (cdddr form))))
+     ;; define-advice: (define-advice FN (WHERE ARGLIST NAME) BODY...)
+     ;; The name-spec (2nd element) contains keywords and arg-list shapes
+     ;; that must not be walked.  Walk only the body forms.
+     ((eq head 'define-advice)
+      `(define-advice ,(cadr form) ,(caddr form)
+         ,@(mapcar #'easy-access-walk (cdddr form))))
+     ;; cl-defmethod: (cl-defmethod NAME [QUALIFIER] ARGLIST BODY...)
+     ;; The arglist contains type specializers (e.g. ((x my-struct)))
+     ;; that must not be walked.  Skip everything up to and including
+     ;; the arglist, walk only the body.
+     ((eq head 'cl-defmethod)
+      (let* ((rest (cdr form))          ; (NAME [QUAL] ARGLIST BODY...)
+             (name (pop rest))
+             ;; Qualifiers are keywords like :around, :before, :after —
+             ;; skip them.
+             (quals nil))
+        (while (and rest (keywordp (car rest)))
+          (push (pop rest) quals))
+        ;; Next element is the arglist — skip it too.
+        (let ((arglist (pop rest)))
+          `(cl-defmethod ,name ,@(nreverse quals) ,arglist
+                         ,@(mapcar #'easy-access-walk rest)))))
+     ;; pcase / pcase-exhaustive: (pcase EXPR (PAT BODY...) ...)
+     ;; Patterns are data — keywords, integers, quoted symbols all
+     ;; appear there as match specs, not accessor forms.  Walk EXPR
+     ;; and each clause's BODY but leave PAT untouched.
+     ((memq head '(pcase pcase-exhaustive))
+      `(,head ,(easy-access-walk (cadr form))
+              ,@(mapcar (lambda (clause)
+                          (cons (car clause)
+                                (mapcar #'easy-access-walk (cdr clause))))
+                        (cddr form))))
+     ;; pcase-let / pcase-let*: (pcase-let ((PAT EXPR) ...) BODY...)
+     ;; Walk each binding's EXPR but leave PAT alone; walk BODY.
+     ((memq head '(pcase-let pcase-let*))
+      `(,head
+        ,(mapcar (lambda (binding)
+                   (if (and (consp binding) (cdr binding))
+                       (cons (car binding)
+                             (mapcar #'easy-access-walk (cdr binding)))
+                     binding))
+                 (cadr form))
+        ,@(mapcar #'easy-access-walk (cddr form))))
+     ;; pcase-dolist: (pcase-dolist (PAT EXPR) BODY...)
+     ;; Walk EXPR and BODY, skip PAT.
+     ((eq head 'pcase-dolist)
+      `(pcase-dolist (,(car (cadr form))
+                      ,(easy-access-walk (cadr (cadr form))))
+         ,@(mapcar #'easy-access-walk (cddr form))))
+     ;; pcase-lambda: (pcase-lambda (PAT ...) BODY...)
+     ;; Patterns are parameter specs, not code — skip them.
+     ((eq head 'pcase-lambda)
+      `(pcase-lambda ,(cadr form)
+         ,@(mapcar #'easy-access-walk (cddr form))))
      ;; cl-defstruct: everything after the name is declarative; do not walk.
      ((eq head 'cl-defstruct) form)
      ;; Threading macros: their expansions reshape bodies in ways that
