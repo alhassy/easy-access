@@ -897,6 +897,16 @@ walking code sub-forms."
      ((eq head 'pcase-lambda)
       `(pcase-lambda ,(cadr form)
          ,@(mapcar #'easy-access-walk (cddr form))))
+     ;; cond: (cond (TEST BODY...) ...)
+     ;; Each clause is a list (TEST BODY...).  Without explicit handling,
+     ;; the default walker passes each clause through `easy-access-walk'
+     ;; as a form — and a clause like (:otherwise BODY) matches the
+     ;; accessor pattern (:keyword obj).  Walking TEST and BODY
+     ;; individually avoids this.
+     ((eq head 'cond)
+      `(cond ,@(mapcar (lambda (clause)
+                         (mapcar #'easy-access-walk clause))
+                       (cdr form))))
      ;; cl-case / case / ecase / cl-ecase / cl-typecase / cl-etypecase:
      ;; (cl-case EXPR (KEY BODY...) ...)
      ;; KEY positions are literal match values (integers, keywords,

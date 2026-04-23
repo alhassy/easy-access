@@ -1273,19 +1273,24 @@ the walker must not rewrite them as accessor forms."
   "Cond clauses like ((and x y) body) and ((fn arg) body) must
 not be treated as accessor forms.  Before the `:read-key' fix,
 `cadr' of `(and x y)' returned `x' -- a symbol -- tricking the
-`quoted-symbols-as-accessors' rule into matching."
+`quoted-symbols-as-accessors' rule into matching.
+Additionally, (:otherwise body) in a cond must not become an
+accessor -- keywords are truthy in Elisp and serve as catch-all
+tests in cond."
   (should
    (equal
     '(cond
       ((and very-stale large-change) "abandon")
       ((<= total 10) 1)
       ((work-item-urgent it) (push it urgent))
+      (:otherwise "default")
       (t nil))
     (easy-access-walk
      '(cond
         ((and very-stale large-change) "abandon")
         ((<= total 10) 1)
         ((work-item-urgent it) (push it urgent))
+        (:otherwise "default")
         (t nil))))))
 
 (provide 'easy-access-tests)
