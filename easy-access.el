@@ -1,7 +1,7 @@
 ;;; easy-access.el --- Clojure-style keyword/integer accessors  -*- lexical-binding: t; -*-
 
 ;; Author: Musa Al-hassy
-;; Version: 0.5.0
+;; Version: 0.5.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: lisp, tools, extensions
 
@@ -420,6 +420,63 @@ This function is the runtime target of forms rewritten by
     (funcall (easy-access-rule-get-fn rule) key obj)))
 
 ;;; -------------------------------------------------------------------------
+;;; Explicit macro form -- variable keys
+;;; -------------------------------------------------------------------------
+;;;
+;;; The read-time walker is deliberately literal-only: it rewrites
+;;; `(:a :b obj)' and `('name obj)' at read time, before bindings exist,
+;;; so a variable or computed expression in head position stays a plain
+;;; function call.  That's by design -- the walker has no way to know
+;;; that `x' in `(x obj)' is intended as a key rather than a function.
+;;;
+;;; For the variable-key case we offer `easy-access' as an explicit
+;;; macro.  `(easy-access K0 K1 ... Kn COLL)' is a left-fold over
+;;; `easy-access-lookup', with each Ki treated as an ordinary Elisp
+;;; expression -- so `(intern ...)', `(match-string ...)', and plain
+;;; variables all Just Work, dispatching through the same rules
+;;; registry as the walker.
+;;;
+;;; The shape mirrors `easy-access--expand-accessor' (the walker's
+;;; fold), so `(easy-access 'owner 'name x)' agrees exactly with the
+;;; literal form `('owner 'name x)': left-to-right, outermost key
+;;; last.
+
+(defmacro easy-access (&rest args)
+  "Left-to-right accessor chain whose keys are ordinary expressions.
+ARGS is (K0 K1 ... Kn COLLECTION) with at least one key and a
+collection.  Each Ki is evaluated as a normal Elisp expression --
+unlike the read-time walker, which treats the head position of
+`(K0 K1 ... Kn COLL)' as literal syntax.  Expands to a left-fold
+over `easy-access-lookup', mirroring `easy-access--expand-accessor'.
+
+Use this when a key is runtime-computed: `(intern ...)', a let-bound
+variable, `(match-string ...)', and so on.  When every key is a
+literal, the reader hook already handles the terser
+`(K0 K1 ... COLL)' syntax.
+
+Examples:
+
+  (easy-access (intern (string kind)) \\='(b ?\\* i ?\\/ u ?\\_ c ?\\~))
+    ==> lookup via `plist-get' on the plist, with a computed key.
+
+  (easy-access (string-trim s) alist)
+    ==> lookup via `assoc' on the alist (string key, `equal').
+
+  (easy-access :name 0 users)
+    ==> (easy-access-lookup (easy-access-lookup users 0) :name)
+
+Chain order is strictly left-to-right: the first key drills into
+COLL, the next into that result, and so on."
+  (declare (indent 0))
+  (unless (>= (length args) 2)
+    (signal 'wrong-number-of-arguments '(easy-access 2)))
+  (let ((keys (butlast args))
+        (coll (car (last args))))
+    (cl-reduce (lambda (acc key) `(easy-access-lookup ,acc ,key))
+               keys
+               :initial-value coll)))
+
+;;; -------------------------------------------------------------------------
 ;;; setf support
 ;;; -------------------------------------------------------------------------
 ;;;
@@ -586,9 +643,10 @@ Needed for string keys where `assq' would miss the pair."
 (defcall strings-as-accessors (head target &optional value)
   :when (stringp head)
   "String CARs look up by `equal' association; `setf'-able.
-Dispatches to alist pairs (via `assoc') or hash-table entries
-\(via `gethash' with `equal' test).  Alist detection uses the
-same \"CAR is a cons cell\" heuristic as keywords."
+Dispatches to alist pairs (via `assoc'), hash-table entries
+\(via `gethash'), or plist cells (via `plist-get' with `equal'
+predicate).  Alist detection uses the same \"CAR is a cons cell\"
+heuristic as keywords — anything else that is a list is a plist."
   (cond
    ((easy-access--alistp target)
     (if (easy-access-setting-p)
@@ -598,6 +656,10 @@ same \"CAR is a cons cell\" heuristic as keywords."
     (if (easy-access-setting-p)
         (puthash head value target)
       (gethash head target)))
+   ((listp target)
+    (if (easy-access-setting-p)
+        (progn (plist-put target head value #'equal) value)
+      (plist-get target head #'equal)))
    (t (signal 'easy-access-invalid-key (list head target)))))
 
 ;;; -------------------------------------------------------------------------
@@ -802,6 +864,365 @@ by `eval' advice); double-walking must be harmless."
    ;; Everything else: dispatch on CAR.
    (t (easy-access--walk-compound form))))
 
+;;; -------------------------------------------------------------------------
+;;; Declarative special-form handlers -- `defcall-rewrite'
+;;; -------------------------------------------------------------------------
+;;;
+;;; Most special-form branches in `easy-access--walk-compound' share a
+;;; simple structure: destructure the form, pass /some/ sub-forms through
+;;; `easy-access-walk', leave the rest verbatim, re-assemble.  That shape
+;;; is mechanical and worth capturing declaratively -- especially so that
+;;; third-party code can teach the walker about its own macros without
+;;; patching this file.
+;;;
+;;; A `defcall-rewrite' entry pairs a SOURCE (what to match) with a
+;;; TARGET (what to emit).  Inside the target, two markers drive
+;;; recursive rewriting of sub-forms:
+;;;
+;;;   (rewrite! X)       -- rewrite one sub-form: expands to
+;;;                          `(easy-access-walk X)'.
+;;;   (rewrite-each! XS) -- rewrite each element of a list: expands to
+;;;                          `(mapcar #'easy-access-walk XS)' spliced in.
+;;;
+;;; Rest-capture uses native Lisp dotted-tail notation: `(HEAD a b . body)'
+;;; matches `(HEAD 1 2 3 4 ...)' with `body' bound to `(3 4 ...)', and a
+;;; target like `(HEAD a b . body)' re-attaches that tail verbatim.
+;;; Proper-list elements are strictly positional -- no CL-style `&body'
+;;; marker needed.
+;;;
+;;; Any other sub-form in the target is emitted verbatim, with source
+;;; binders substituted.  The target is returned AS-IS -- the walker
+;;; does NOT re-walk it.  Re-entry happens only through the explicit
+;;; `rewrite!' / `rewrite-each!' markers.
+;;;
+;;; Example:
+;;;
+;;;   (defcall-rewrite define-advice-rewrite
+;;;     \"Skip the name-spec; rewrite only the body.\"
+;;;     :source (define-advice fn name-spec . body)
+;;;     :target (define-advice fn name-spec (rewrite-each! body)))
+;;;
+;;; Matcher backend is `pcase' -- we compile SOURCE into a pcase pattern
+;;; and TARGET into a constructor expression in one shot, so nested
+;;; destructuring, arity-mismatch fallthrough, and rest-capture all
+;;; come for free.
+
+(cl-defstruct easy-access-rewrite
+  "One rewrite entry: a source pattern plus a target template.
+NAME        -- symbol, for upsert / remove by identity.
+DOCSTRING   -- optional human-readable description.
+SOURCE-HEAD -- the CAR symbol this rewrite matches; used to cull the
+               registry scan in `easy-access--rewrite-dispatch'.
+MATCH-FN    -- a unary function of FORM that returns either the
+               rewritten form or the sentinel symbol
+               `easy-access--rewrite-no-match' on failure."
+  name docstring source-head match-fn)
+
+(defvar easy-access--rewrites nil
+  "List of active `easy-access-rewrite' records.
+Walked front-to-back in `easy-access--rewrite-dispatch'; the first
+rewrite whose matcher succeeds wins.  Most-recently-defined rewrites
+sit at the front -- see `easy-access--upsert-rewrite'.")
+
+(defun easy-access--upsert-rewrite (rewrite)
+  "Install REWRITE into `easy-access--rewrites'.
+Upserts by NAME: an existing rewrite with the same NAME is replaced
+in place /and/ promoted to the front.  A new NAME is pushed to the
+front.  Mirrors `easy-access--upsert-rule' for `defcall' rules."
+  (let ((name (easy-access-rewrite-name rewrite)))
+    (setq easy-access--rewrites
+          (cl-delete-if (lambda (r)
+                          (eq (easy-access-rewrite-name r) name))
+                        easy-access--rewrites))
+    (push rewrite easy-access--rewrites))
+  rewrite)
+
+(defun easy-access-remove-rewrite (name)
+  "Remove the rewrite named NAME from the registry.
+Returns non-nil if a rewrite was removed.  Inverse of
+`defcall-rewrite'; useful in tests and for undoing a user-defined
+handler."
+  (let ((before (length easy-access--rewrites)))
+    (setq easy-access--rewrites
+          (cl-delete-if (lambda (r)
+                          (eq (easy-access-rewrite-name r) name))
+                        easy-access--rewrites))
+    (/= before (length easy-access--rewrites))))
+
+(defun easy-access--source-head (source)
+  "Return the head symbol of SOURCE (a `defcall-rewrite' source pattern).
+The head is the first element and must be a non-keyword symbol.
+Signals an error otherwise -- a rewrite whose head is a binder
+would match any compound form, which is never what users want."
+  (unless (and (consp source) (symbolp (car source))
+               (not (keywordp (car source))))
+    (error "defcall-rewrite: SOURCE must start with a literal head symbol, got %S"
+           source))
+  (car source))
+
+(defun easy-access--source-collect-binders (source)
+  "Return the list of binder symbols in SOURCE, in left-to-right order.
+The first element of SOURCE is the literal head -- it is NOT a binder.
+Nested lists contribute their own binders recursively.  A *dotted*
+tail at any list level names a rest-binder; a proper-list positional
+element is a plain binder.  Either way it goes into the list."
+  (let ((binders nil))
+    (cl-labels
+        ((walk (p)
+           (cond
+            ((null p) nil)
+            ((symbolp p)
+             (unless (keywordp p)
+               (push p binders)))
+            ((consp p)
+             (walk (car p)) (walk (cdr p))))))
+      ;; Skip the head; it is the literal match target.
+      (walk (cdr source)))
+    (nreverse binders)))
+
+(defun easy-access--source->pcase (source)
+  "Translate a `defcall-rewrite' SOURCE pattern into a `pcase' pattern.
+
+The top-level head of SOURCE is a literal symbol; inside, every
+bare symbol becomes a binder.  A trailing bare symbol in any list
+is a rest-capture (the dotted tail), so `(HEAD a b body)' matches
+`(HEAD x y z w ...)' with `body' bound to `(z w ...)'.  Nested
+lists destructure positionally.
+
+Returns a `pcase' pattern suitable for use as the first element of
+a pcase clause."
+  (let ((head (car source))
+        (rest (cdr source)))
+    ;; Top level MUST be a proper backquote pattern with literal head.
+    ;; The `rest' items translate via `--source->pcase-inner-list'.
+    (cons '\` (list (cons head (easy-access--source->pcase-inner-list rest))))))
+
+(defun easy-access--source->pcase-inner-list (items)
+  "Translate a list of source ITEMS to the interior of a backquote pcase.
+A *dotted* tail (i.e. ITEMS itself is an improper list ending in a
+bare binder symbol) becomes a pcase dotted-tail unquote -- that is
+how you opt into rest-capture in the DSL.  Proper lists always
+destructure positionally."
+  (cond
+   ((null items) nil)
+   ;; Improper-list dotted tail: `(... . BINDER)'.
+   ((and (not (consp items)) (symbolp items) items
+         (not (keywordp items)) (not (memq items '(t nil))))
+    (list '\, items))
+   ((not (consp items))
+    ;; Dotted tail that is NOT a plain binder -- literal.
+    items)
+   (t
+    (cons (easy-access--source->pcase-inner-atom (car items))
+          (easy-access--source->pcase-inner-list (cdr items))))))
+
+(defun easy-access--source->pcase-inner-atom (item)
+  "Translate a single source ITEM (not a rest-capture) to its pcase form.
+Symbols become `,SYM' unquote-binders; keywords / t / nil pass
+through as literals; nested lists recurse."
+  (cond
+   ((null item) nil)
+   ((symbolp item)
+    (if (or (keywordp item) (memq item '(t nil)))
+        item
+      (list '\, item)))
+   ((consp item)
+    (easy-access--source->pcase-inner-list item))
+   (t item)))
+
+(defun easy-access--target->template (target binders)
+  "Translate a `defcall-rewrite' TARGET into a *constructor expression*.
+BINDERS is the list of symbols captured by the source pattern; symbols
+in TARGET that appear in BINDERS are emitted as variable reads,
+everything else is quoted.
+
+The returned expression, when evaluated in a lexical context where the
+source binders are bound, produces the rewritten form.
+
+- A binder `X' becomes the expression `X' (reads the binder).
+- `(rewrite! X)' becomes `(easy-access-walk X)' (X evaluated in scope).
+- `(rewrite-each! XS)' becomes `(mapcar #\\='easy-access-walk XS)'.
+- Any other list is built with `cons'/`append' constructors so that
+  literal heads remain quoted and binders are spliced in.  A
+  `(rewrite-each! XS)' sitting in list position is spliced via `append'."
+  (cond
+   ((null target) nil)
+   ((symbolp target)
+    (if (memq target binders) target (list 'quote target)))
+   ((consp target)
+    (pcase target
+      (`(rewrite! ,x)
+       (list 'easy-access-walk (easy-access--target->template x binders)))
+      (`(rewrite-each! ,xs)
+       (list 'mapcar (list 'function 'easy-access-walk)
+             (easy-access--target->template xs binders)))
+      (_ (easy-access--target->template-list target binders))))
+   (t (list 'quote target))))
+
+(defun easy-access--target->template-list (items binders)
+  "Translate a proper list ITEMS of target elements into a constructor.
+A dotted-tail ITEMS ending in a bare binder symbol emits the binder
+in the list's cdr, so a source-side rest-capture flows back into the
+target verbatim.  Splices `(rewrite-each! XS)' elements via `append'.
+BINDERS is the source pattern's binder list."
+  (cond
+   ((null items) nil)
+   ;; Improper-list dotted tail ending in a source binder: emit as the
+   ;; cdr of the enclosing list.
+   ((and (not (consp items)) (symbolp items) (memq items binders))
+    items)
+   ((not (consp items))
+    ;; Dotted tail that is NOT a recognised binder: literal.
+    (list 'quote items))
+   (t
+    (let ((head (car items))
+          (tail (cdr items)))
+      (pcase head
+        (`(rewrite-each! ,xs)
+         (list 'append
+               (list 'mapcar (list 'function 'easy-access-walk)
+                     (easy-access--target->template xs binders))
+               (easy-access--target->template-list tail binders)))
+        (_
+         (list 'cons
+               (easy-access--target->template head binders)
+               (easy-access--target->template-list tail binders))))))))
+
+(defun easy-access--target-collect-binders (target)
+  "Collect binder-candidate symbols referenced in TARGET.
+`TARGET' is a template form `(HEAD ARG...)'.  `HEAD' is an operator
+literal, skipped.  Each `ARG' may itself be a form -- its own head
+is then an operator we also skip.  The result is a de-duplicated list
+of symbols in argument positions, ready for cross-check against the
+source pattern's binders."
+  (let ((syms nil))
+    (cl-labels
+        ((arg (r)
+           ;; R sits in an argument position.
+           (cond
+            ((null r) nil)
+            ((symbolp r)
+             (unless (or (keywordp r) (memq r '(t nil)))
+               (push r syms)))
+            ((consp r)
+             (pcase r
+               (`(quote ,_) nil)                 ; 'x is literal
+               (`(function ,_) nil)              ; #'x is literal
+               (`(rewrite! ,x) (arg x))
+               (`(rewrite-each! ,xs) (arg xs))
+               (_
+                ;; Nested form `(OP a b c)': OP skipped, children are
+                ;; argument positions.
+                (mapc #'arg (cdr r))))))))
+      ;; The cdr of TARGET is either a proper list of arg positions or
+      ;; an improper tail ending in a rest-binder.  Either way, a tail
+      ;; walk that visits every cons-cell AND the final atom collects
+      ;; every binder-candidate.
+      (let ((tail (cdr target)))
+        (while (consp tail)
+          (arg (car tail))
+          (setq tail (cdr tail)))
+        (when tail (arg tail))))
+    (delete-dups (nreverse syms))))
+
+(defmacro defcall-rewrite (name &rest spec)
+  "Declare a walker rewrite NAME for a macro or special-form shape.
+
+SPEC is, in order:
+
+  [DOCSTRING]        -- optional string.
+  :source (HEAD ...) -- the shape to match.  HEAD is a literal
+                        symbol; every other symbol in SOURCE is a
+                        binder.  A *dotted* tail `(... . BINDER)' at
+                        any list level names a rest-binder that
+                        captures the (possibly empty) cdr.  Proper
+                        lists destructure strictly positionally.
+  :target (HEAD ...) -- the shape to emit.  Binders from SOURCE
+                        substitute in place.  Inside TARGET:
+                          (rewrite! X)       -- rewrite one sub-form.
+                          (rewrite-each! XS) -- rewrite each element
+                                                 of a list and splice
+                                                 the results in place.
+                        A dotted-tail target `(... . BINDER)' emits
+                        the source-side rest-capture as the cdr, so
+                        rest flows through without ever appearing
+                        nested.  Any other sub-form is emitted
+                        verbatim.  The target is returned AS-IS --
+                        the walker does NOT re-walk it.  Re-entry is
+                        via the explicit `rewrite!' / `rewrite-each!'
+                        markers.
+
+NAME is a symbol: re-defining an existing NAME upserts and promotes
+it to the front of `easy-access--rewrites'.
+
+Example:
+
+  (defcall-rewrite define-advice-rewrite
+    \"Skip the name-spec; rewrite only the body.\"
+    :source (define-advice fn name-spec . body)
+    :target (define-advice fn name-spec (rewrite-each! body)))
+
+\(fn NAME [DOCSTRING] :source SOURCE :target TARGET)"
+  (declare (indent 1) (doc-string 2))
+  (let ((docstring (when (stringp (car spec)) (pop spec)))
+        source target)
+    (while (keywordp (car spec))
+      (let ((k (pop spec))
+            (v (pop spec)))
+        (pcase k
+          (:source (setq source v))
+          (:target (setq target v))
+          (_ (error "defcall-rewrite: unknown option %S" k)))))
+    (unless source (error "defcall-rewrite: missing :source"))
+    (unless target (error "defcall-rewrite: missing :target"))
+    (let* ((head (easy-access--source-head source))
+           (binders (easy-access--source-collect-binders source))
+           (target-syms (easy-access--target-collect-binders target))
+           (unbound (cl-set-difference target-syms binders)))
+      ;; Cross-check: every symbol the target references that isn't a
+      ;; function or global must come from the source pattern.  We
+      ;; can't know at expansion time what's global, but flagging
+      ;; unbound symbols catches typos like (rewrite-each! bdoy).
+      ;; Allow fboundp symbols through -- they're function references.
+      (let ((truly-unbound
+             (cl-remove-if (lambda (s)
+                             (or (fboundp s)
+                                 (boundp s)
+                                 (keywordp s)))
+                           unbound)))
+        (when truly-unbound
+          (error "defcall-rewrite %S: target references unbound symbols %S (binders: %S)"
+                 name truly-unbound binders)))
+      (let ((form-sym (make-symbol "form")))
+        `(easy-access--upsert-rewrite
+          (make-easy-access-rewrite
+           :name ',name
+           :docstring ,docstring
+           :source-head ',head
+           :match-fn
+           (lambda (,form-sym)
+             (pcase ,form-sym
+               (,(easy-access--source->pcase source)
+                ,(easy-access--target->template target binders))
+               (_ 'easy-access--rewrite-no-match)))))))))
+
+(defun easy-access--rewrite-dispatch (form)
+  "Try every registered rewrite against FORM.
+Returns the rewritten form, or the sentinel
+`easy-access--rewrite-no-match' when no rewrite matches.  Linear
+scan over `easy-access--rewrites', culled by `source-head' `eq' match
+on FORM's CAR so the typical call checks one or two matchers."
+  (let ((head (car-safe form))
+        (rs easy-access--rewrites)
+        (result 'easy-access--rewrite-no-match))
+    (while (and rs (eq result 'easy-access--rewrite-no-match))
+      (let ((r (car rs)))
+        (when (eq (easy-access-rewrite-source-head r) head)
+          (setq result (funcall (easy-access-rewrite-match-fn r)
+                                form))))
+      (setq rs (cdr rs)))
+    result))
+
 (defun easy-access--walk-compound (form)
   "Walk a non-accessor compound FORM.
 Dispatches on CAR to handle special forms correctly -- skipping
@@ -823,6 +1244,18 @@ walking code sub-forms."
      ;; Backquote: walk the template, respecting unquotes.
      ((eq head '\`)
       (list '\` (easy-access--walk-backquote (cadr form))))
+     ;; User-defined rewrites (see `defcall-rewrite').  Dispatched
+     ;; AFTER quote/function/backquote (those are load-bearing invariants)
+     ;; and BEFORE every other branch -- so a rewrite can override the
+     ;; built-in handlers and, crucially, fire before generic macro
+     ;; expansion would eat the form.
+     ;; Returns the rewritten form if a rewrite fired, else falls
+     ;; through.  Real rewrites are always compound forms (their CAR is
+     ;; the source head), so nil-vs-no-match is not a practical
+     ;; ambiguity.
+     ((let ((rewritten (easy-access--rewrite-dispatch form)))
+        (and (not (eq rewritten 'easy-access--rewrite-no-match))
+             rewritten)))
      ;; let / let*: walk binding RHS expressions, skip binding names;
      ;; walk body.
      ((memq head '(let let*))
@@ -847,20 +1280,6 @@ walking code sub-forms."
                      (cons (car handler)
                            (mapcar #'easy-access-walk (cdr handler))))
                    (cdddr form))))
-     ;; lambda / defun / defmacro / cl-defun / cl-defmacro:
-     ;; skip the arg list; walk the body.
-     ((memq head '(lambda))
-      `(lambda ,(cadr form)
-         ,@(mapcar #'easy-access-walk (cddr form))))
-     ((memq head '(defun defmacro defsubst cl-defun cl-defmacro))
-      `(,head ,(cadr form) ,(caddr form)
-              ,@(mapcar #'easy-access-walk (cdddr form))))
-     ;; define-advice: (define-advice FN (WHERE ARGLIST NAME) BODY...)
-     ;; The name-spec (2nd element) contains keywords and arg-list shapes
-     ;; that must not be walked.  Walk only the body forms.
-     ((eq head 'define-advice)
-      `(define-advice ,(cadr form) ,(caddr form)
-         ,@(mapcar #'easy-access-walk (cdddr form))))
      ;; cl-defmethod: (cl-defmethod NAME [QUALIFIER] ARGLIST BODY...)
      ;; The arglist contains type specializers (e.g. ((x my-struct)))
      ;; that must not be walked.  Skip everything up to and including
@@ -877,6 +1296,24 @@ walking code sub-forms."
         (let ((arglist (pop rest)))
           `(cl-defmethod ,name ,@(nreverse quals) ,arglist
                          ,@(mapcar #'easy-access-walk rest)))))
+     ;; cl-letf / cl-letf*: (cl-letf ((PLACE VALUE) ...) BODY...)
+     ;; PLACE is a generalized variable -- the gv machinery must see
+     ;; raw accessor forms like `(:key obj)' so it can dispatch via
+     ;; `gv-define-setter'.  VALUE is code.  BODY is code.  Walk only
+     ;; VALUE and BODY; leave PLACE untouched.  This is why `cl-letf'
+     ;; sits in `easy-access--gv-macros' -- it must not be
+     ;; macroexpanded before the walker gets to it.  A `defcall-rewrite'
+     ;; would need to express "walk the 2nd element of each binding,"
+     ;; which the declarative DSL cannot say tersely.
+     ((memq head '(cl-letf cl-letf*))
+      `(,head
+        ,(mapcar (lambda (binding)
+                   (if (and (consp binding) (consp (cdr binding)))
+                       (list (car binding)
+                             (easy-access-walk (cadr binding)))
+                     binding))
+                 (cadr form))
+        ,@(mapcar #'easy-access-walk (cddr form))))
      ;; pcase / pcase-exhaustive: (pcase EXPR (PAT BODY...) ...)
      ;; Patterns are data — keywords, integers, quoted symbols all
      ;; appear there as match specs, not accessor forms.  Walk EXPR
@@ -898,17 +1335,6 @@ walking code sub-forms."
                      binding))
                  (cadr form))
         ,@(mapcar #'easy-access-walk (cddr form))))
-     ;; pcase-dolist: (pcase-dolist (PAT EXPR) BODY...)
-     ;; Walk EXPR and BODY, skip PAT.
-     ((eq head 'pcase-dolist)
-      `(pcase-dolist (,(car (cadr form))
-                      ,(easy-access-walk (cadr (cadr form))))
-         ,@(mapcar #'easy-access-walk (cddr form))))
-     ;; pcase-lambda: (pcase-lambda (PAT ...) BODY...)
-     ;; Patterns are parameter specs, not code — skip them.
-     ((eq head 'pcase-lambda)
-      `(pcase-lambda ,(cadr form)
-         ,@(mapcar #'easy-access-walk (cddr form))))
      ;; cond: (cond (TEST BODY...) ...)
      ;; Each clause is a list (TEST BODY...).  Without explicit handling,
      ;; the default walker passes each clause through `easy-access-walk'
@@ -931,8 +1357,6 @@ walking code sub-forms."
                           (cons (car clause)
                                 (mapcar #'easy-access-walk (cdr clause))))
                         (cddr form))))
-     ;; cl-defstruct: everything after the name is declarative; do not walk.
-     ((eq head 'cl-defstruct) form)
      ;; Keyword-plist macros: macroexpand before walking.
      ;;
      ;; Macros like `use-package', `define-relation', and other
@@ -973,6 +1397,98 @@ is preserved verbatim."
     (cons (easy-access--walk-backquote (car form))
           (easy-access--walk-backquote (cdr form))))
    (t form)))
+
+;;; -------------------------------------------------------------------------
+;;; Built-in rewrites
+;;; -------------------------------------------------------------------------
+;;;
+;;; Handlers for special forms whose shape fits the declarative DSL
+;;; cleanly.  Registering them here (rather than hand-coding in
+;;; `easy-access--walk-compound') means they sit in exactly the same
+;;; registry as user-defined rewrites -- users can inspect, override,
+;;; or remove them by name just like any other entry.
+;;;
+;;; Handlers kept imperative in `easy-access--walk-compound' are those
+;;; the DSL cannot express without contorting: `let'/`let*' (per-binding
+;;; shape dispatch), `cl-defmethod' (variable-length qualifier prefix),
+;;; `cond'/`cl-case'/`condition-case' (clause-walking semantics),
+;;; `pcase' (subtle quoted-symbol-pattern interaction), and backquote.
+
+(defcall-rewrite define-advice-rewrite
+  "Skip the name-spec (2nd element); rewrite only the body forms.
+The name-spec contains keywords and arg-list shapes that must not
+be rewritten."
+  :source (define-advice fn name-spec . body)
+  :target (define-advice fn name-spec (rewrite-each! body)))
+
+(defcall-rewrite cl-defstruct-rewrite
+  "Everything after the name is declarative; rewrite nothing.
+Slot declarations look like `(slot-name default)' -- rewriting them
+would turn defaults that happen to match the accessor shape into
+`easy-access-lookup' calls."
+  :source (cl-defstruct . rest)
+  :target (cl-defstruct . rest))
+
+(defcall-rewrite lambda-rewrite
+  "Skip the arglist; rewrite the body forms."
+  :source (lambda args . body)
+  :target (lambda args (rewrite-each! body)))
+
+(defcall-rewrite defun-rewrite
+  "Skip the name and arglist; rewrite the body.
+Shared entry for the `defun' family -- re-registering with the same
+NAME at the call site upserts this rule, so users may override it
+per-macro without racing the registration order."
+  :source (defun name args . body)
+  :target (defun name args (rewrite-each! body)))
+
+(defcall-rewrite defmacro-rewrite
+  "Skip the name and arglist; rewrite the body."
+  :source (defmacro name args . body)
+  :target (defmacro name args (rewrite-each! body)))
+
+(defcall-rewrite defsubst-rewrite
+  "Skip the name and arglist; rewrite the body."
+  :source (defsubst name args . body)
+  :target (defsubst name args (rewrite-each! body)))
+
+(defcall-rewrite cl-defun-rewrite
+  "Skip the name and arglist; rewrite the body."
+  :source (cl-defun name args . body)
+  :target (cl-defun name args (rewrite-each! body)))
+
+(defcall-rewrite cl-defmacro-rewrite
+  "Skip the name and arglist; rewrite the body."
+  :source (cl-defmacro name args . body)
+  :target (cl-defmacro name args (rewrite-each! body)))
+
+(defcall-rewrite cl-defsubst-rewrite
+  "Skip the name and arglist; rewrite the body.
+`cl-defsubst' macroexpands into a `cl-defun' form, which our
+`cl-defun-rewrite' already handles -- but catching it up-front avoids
+walking the arglist during the fraction of a millisecond between
+declaration and expansion."
+  :source (cl-defsubst name args . body)
+  :target (cl-defsubst name args (rewrite-each! body)))
+
+(defcall-rewrite iter-defun-rewrite
+  "Skip the name and arglist; rewrite the body.
+`iter-defun' is from `generator.el' and has the shape of a regular
+`defun' plus `iter-yield' in the body."
+  :source (iter-defun name args . body)
+  :target (iter-defun name args (rewrite-each! body)))
+
+(defcall-rewrite pcase-dolist-rewrite
+  "Skip the pattern; rewrite the sequence expression and the body.
+The binding has shape `(PAT EXPR)' -- PAT is a match spec, EXPR is
+code."
+  :source (pcase-dolist (pat expr) . body)
+  :target (pcase-dolist (pat (rewrite! expr)) (rewrite-each! body)))
+
+(defcall-rewrite pcase-lambda-rewrite
+  "Skip the parameter patterns; rewrite the body."
+  :source (pcase-lambda pats . body)
+  :target (pcase-lambda pats (rewrite-each! body)))
 
 ;;; -------------------------------------------------------------------------
 ;;; Hooks and advice

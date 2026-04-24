@@ -7,7 +7,7 @@
   - (:key plist) — plist lookup
   - ('sym plist) — plain-symbol plist lookup (symbol-plist etc.)
   - (:key alist) / ('sym alist) — alist lookup (CAR-is-a-cons heuristic)
-  - ("str" alist) / ("str" hash) — string-keyed alist/hash lookup (equal)
+  - ("str" alist) / ("str" plist) / ("str" hash) — string-keyed lookup (equal)
   - (:field struct) / ('field struct) — struct slot access (memoised)
   - (:key hash-table) / ('sym hash-table) — gethash fallback
   - (N seq) — nth/elt into lists, vectors, strings; negative N counts
@@ -26,15 +26,16 @@
     rules (integers, keywords, quoted-symbols, strings) are themselves
     defcall forms; new shapes (characters, …) are declared in a single
     form without touching the walker
-  - 93 of 93 tests passing, zero byte-compile warnings
+  - 120 of 120 tests passing, zero byte-compile warnings
 #+end_comment
 
 * What & Why
 
 We bring Clojure's terse accessor syntax to Emacs Lisp.  Concretely — where
 we once wrote ~(plist-get user :name)~, we now write ~(:name user)~; where
-we wrote ~(nth 3 seq)~, we write ~(3 seq)~; where we wrote
-~(work-item-jira item)~, we write ~(:jira item)~.
+we wrote ~(nth 3 seq)~, we write ~(3 seq)~; where we had a struct like
+~(cl-defstruct pair first second)~ and wrote ~(pair-first p)~, we write
+~(:first p)~.
 
 The savings compound.  A deeply-nested access that used to look like
 
@@ -59,7 +60,7 @@ alists, ~nth~ for lists, ~elt~ or ~aref~ for vectors and strings,
 ~gethash~ for hash tables, a generated ~struct-field~ function for every
 ~cl-defstruct~.  On the write side, a parallel menagerie — ~plist-put~,
 ~setcdr~, ~setcar~ + ~nthcdr~, ~aset~, ~puthash~, ~setf~ of
-~cl-struct-slot-value~.  /Twelve functions to remember/, and the choice
+~cl-struct-slot-value~.  /Fourteen functions to remember/, and the choice
 depends on the container — which the reader has to carry in their head.
 
 ~easy-access~ collapses the table:
@@ -75,6 +76,7 @@ depends on the container — which the reader has to carry in their head.
 | Vector (by index)  | ~(aref v 2)~                 | ~(aset v 2 val)~               | ~(2 v)~        |
 | String (by index)  | ~(aref s 2)~                 | —                              | ~(2 s)~        |
 | Alist (string key) | ~(cdr (assoc "k" a))~        | ~(setcdr (assoc "k" a) v)~     | ~("k" a)~      |
+| Plist (string key) | ~(plist-get p "k" #'equal)~  | ~(plist-put p "k" v #'equal)~  | ~("k" p)~      |
 | Hash (string key)  | ~(gethash "k" h)~            | ~(puthash "k" v h)~            | ~("k" h)~      |
 
 /One/ reader: ~(:k obj)~, ~(N obj)~, or ~("k" obj)~.
@@ -92,6 +94,22 @@ Refactoring a field from plist to struct, or alist to hash table, no
 longer rewrites every call site — the accessor syntax is identical.
 The container is an /implementation detail/; the access pattern is the
 /interface/.
+
+When the key is runtime-computed — a variable, an ~(intern …)~, a
+~(match-string …)~ — the literal reader syntax no longer applies (the
+walker cannot tell ~(var obj)~ apart from an ordinary function call).
+For that case we provide the explicit ~easy-access~ macro, which is
+the /same/ uniform form for runtime keys:
+
+#+begin_src emacs-lisp
+  (easy-access KEY     obj)      ;; replaces plist-get / alist-get / gethash / aref / …
+  (easy-access K0 K1 … obj)      ;; chained, left-to-right
+  (setf (easy-access KEY obj) v) ;; writes dispatch just like reads
+#+end_src
+
+Details — including why we don't extend the walker to handle variable
+keys automatically — live under /Variable keys — the ~easy-access~
+macro/ below.
 
 * Installation
 
@@ -158,19 +176,20 @@ Applies uniformly to lists, vectors, and strings, for both reads and
 This means ~(-1 xs)~ replaces both dash's ~(-last-item xs)~ and stock
 Elisp's ~(car (last xs))~ — one fewer function to remember.
 
-*** ~c*r~ decomposition — a fun consequence
+*** Replacing ~car~ / ~cadr~ / ~nth~
 
-The traditional ~c*r~ tower decomposes into chained integer accessors:
+Integer accessors dispatch to ~nth~, so ~(N xs)~ ≡ ~(nth N xs)~:
 
-- ~(caar x)~ ≡ ~(0 0 x)~
-- ~(cadr x)~ ≡ ~(0 1 x)~
-- ~(caddr x)~ ≡ ~(0 1 1 x)~
-- ~(cadadr x)~ = ~(car (cdr (car (cdr x))))~ ≡ ~(0 1 0 1 x)~
+- ~(car xs)~ ≡ ~(0 xs)~
+- ~(cadr xs)~ ≡ ~(nth 1 xs)~ ≡ ~(1 xs)~
+- ~(caddr xs)~ ≡ ~(nth 2 xs)~ ≡ ~(2 xs)~
+- ~(caar xs)~ ≡ ~(car (car xs))~ ≡ ~(0 0 xs)~
 
-We don't recommend this as a style improvement — Lisp's ~c*r~ names are
-well-known — but it's a satisfying demonstration of the uniform syntax.
-Every ~car~ is ~0~, every ~cdr~ is "drop into the tail" (index ~1~ of a
-cons-as-two-element-list).
+Note that ~cdr~ has no single-integer equivalent: ~(cdr xs)~ returns the
+tail (a list), while ~(1 xs)~ returns the second /element/.  Chained
+~c*r~ forms that only use ~car~ (like ~caar~) decompose into nested
+~0~'s, but mixed ~car~/~cdr~ towers like ~(cadar x)~ don't reduce
+further — use ~nth~ or destructuring instead.
 
 *** Out-of-bounds reads return ~nil~
 
@@ -258,12 +277,32 @@ simply:
     ("Authorization" headers))       ;; ⟹ "Bearer tok"
 #+end_src
 
-Works on ~equal~-test hash tables too:
+Works on string-keyed plists too — stock Emacs 29+ supports
+~(plist-get plist key #'equal)~, and easy-access dispatches to it
+automatically:
+
+#+begin_src emacs-lisp
+  ("hello" '("hello" "world" "where" "here"))  ;; ⟹ "world"
+#+end_src
+
+And on ~equal~-test hash tables:
 
 #+begin_src emacs-lisp
   (let ((h (make-hash-table :test 'equal)))
     (puthash "city" "Kufa" h)
     ("city" h))                      ;; ⟹ "Kufa"
+#+end_src
+
+The dispatcher distinguishes alists from plists by the same heuristic
+used for keywords: if the first element of the list is a cons cell,
+it is an alist (dispatched to ~assoc~); otherwise it is a plist
+(dispatched to ~plist-get~ with ~#'equal~).  Both forms work:
+
+#+begin_src emacs-lisp
+  ;; Alist — CAR is a cons cell:
+  ("hello" '(("hello" . "world")))   ;; ⟹ "world"
+  ;; Plist — CAR is a string atom:
+  ("hello" '("hello" "world"))       ;; ⟹ "world"
 #+end_src
 
 String keys participate in chained access just like keywords and
@@ -286,6 +325,46 @@ is purely additive.
 The accessor dispatches via the generated ~point-label~ function.
 Struct-slot lookup is memoised, so repeated access is cheap.
 
+*** Structs are just named plists
+
+~easy-access~ blurs the distinction between plists and structs — they are
+accessed the exact same way and built almost the same way:
+
+#+begin_src emacs-lisp
+  (cl-defstruct pair first second)          ;; Declare a "plist schema"
+
+  (setq p1 (list      :first "me" :second "you")) ;; Creation
+  (setq p2 (make-pair :first "me" :second "you")) ;; Almost the same thing!
+
+  ;; Usage — identical!
+  (:first p1) ;; ⟹ "me"
+  (:first p2) ;; ⟹ "me"
+#+end_src
+
+A struct is, in effect, a /named plist/ — a plist that carries a type tag.
+The only surface difference is whether you write ~(list ...)~ or
+~(make-pair ...)~ to construct one.
+
+But that type tag buys you two things a bare plist lacks:
+
+1. *Predicates.* ~pair-p~ checks whether a Lisp object is a ~pair~ — i.e.,
+   a plist with /exactly/ the slots you declared.
+2. *Methods.* ~cl-defmethod~ dispatches on the struct type, so you can
+   attach behaviour to it:
+
+#+begin_src emacs-lisp
+  (cl-defmethod shout ((p pair))
+    (format "I am %s and %s" (:first p) (:second p)))
+
+  (shout p2) ;; ⟹ "I am me and you"
+  (shout p1) ;; Error: no applicable method for (list ...)
+#+end_src
+
+So the gradient is: plist (ad-hoc, zero ceremony) → struct (typed,
+predicate + methods).  ~easy-access~ makes the /read path/ identical,
+so you can start with a bare plist and promote to a struct later
+without rewriting any accessor call sites.
+
 ** Chained access
 
 #+begin_src emacs-lisp
@@ -293,9 +372,30 @@ Struct-slot lookup is memoised, so repeated access is cheap.
   ;; ⟹ "found!"
 #+end_src
 
-Reads left-to-right as a path: index ~1~ into the outer list yields the
-inner list, ~:b~ descends, then ~:a~ — three accessors in a single form.
-Matches Clojure's ~(get-in obj [1 :b :a])~ semantics.
+Accessors are applied first-come-first-served, left-to-right: index ~1~
+into the outer list yields the inner list, ~:b~ descends, then ~:a~ —
+three accessors in a single form.  Matches Clojure's ~(get-in obj [1 :b :a])~
+semantics.
+
+By way of example, the verbose Elisp
+
+#+begin_src emacs-lisp
+  (alist-get 'name (alist-get 'owner record))
+#+end_src
+
+collapses to
+
+#+begin_src emacs-lisp
+  ('owner 'name record)
+#+end_src
+
+which reads just like JavaScript's ~record.owner.name~ — the path from
+container to leaf, in the order you think about it.  In fact, with
+~thread-first~ we can write it even more literally:
+
+#+begin_src emacs-lisp
+  (-> record :owner :name)           ;; identical to (:owner :name record)
+#+end_src
 
 Chained access crosses container types freely — a vector-in-alist-in-list
 path just works:
@@ -305,6 +405,30 @@ path just works:
     (0 :users 0 db))               ;; ⟹ "Ali"
     ;; (0 db) → alist → (:users) → vector → (0) → "Ali"
 #+end_src
+
+*** Threading and quoted symbols
+
+For keywords, integers, and strings, ~(k0 k1 … kN c)~ ≡ ~(-> c k0 k1 … kN)~:
+
+#+begin_src emacs-lisp
+  (:owner :name record)              ;; ≡ (-> record :owner :name)
+  (0 :users db)                      ;; ≡ (-> db 0 :users)
+  ("x" alist)                        ;; ≡ (-> alist "x")
+#+end_src
+
+Quoted symbols are the exception.  ~(-> x 'a)~ first desugars the
+reader shorthand: ~(-> x (quote a))~.  ~thread-first~ then threads ~x~
+into the first argument of ~(quote a)~, producing ~(quote a x)~ — and
+~quote~ takes exactly one argument, so this is a read error.  Wrap each
+quoted-symbol step in parens:
+
+#+begin_src emacs-lisp
+  ('owner 'name obj)                 ;; ≡ (-> obj ('owner) ('name))
+  ;; NOT: (-> obj 'owner 'name)      — ERROR: quote expects 1 argument
+#+end_src
+
+This is purely a threading-macro surface issue; the chained form
+~('owner 'name obj)~ works without parens as always.
 
 ** ~setf~ — updates dispatch just like reads
 
@@ -362,7 +486,8 @@ position.  ~(:foo p)~ signals ~void-function :foo~ in stock Elisp — the
 C evaluator does not dispatch through the keyword's function slot.
 
 ~easy-access~ works around this /not/ by patching the evaluator, but by
-rewriting forms /before/ evaluation.  A recursive code walker,
+hijacking Lisp's function-application literal syntax ~(f x)~ — rewriting
+forms /before/ evaluation.  A recursive code walker,
 ~easy-access-walk~, transforms
 
 #+begin_src emacs-lisp
@@ -375,7 +500,15 @@ rewriting forms /before/ evaluation.  A recursive code walker,
                                  1)
 #+end_src
 
-and ~easy-access-lookup~ dispatches at runtime by walking a registry
+Because easy-access hijacks /call syntax/ — the ~(f x)~ shape — it never
+introduces new functions.  Given ~(cl-defstruct pair first second)~, the
+shorthand ~(:first p)~ is rewritten at the call site, but ~:first~ itself
+is not a function — you cannot write ~#':first~ or pass it to ~mapcar~.
+When you need a function reference, use the generated struct accessor:
+~#'pair-first~ still works with ~-filter~, ~mapcar~, ~funcall~, etc.
+exactly as before.  The walker leaves ~#'pair-first~ (a value) untouched.
+
+~easy-access-lookup~ dispatches at runtime by walking a registry
 of /rules/.  Each rule declares a CAR-shape guard — the shape of the
 HEAD the rule claims — and a body that dispatches per-target.  Read
 every row below as a method clause of one of three built-in ~defcall~
@@ -441,22 +574,67 @@ This means plist literals like ~(setq foo (list :bar 1 :baz 2))~ are
 untouched — ~:bar~ and ~:baz~ are in /data/ position, not function
 position.
 
-** Known limitation: variable keys
+** Variable keys — the ~easy-access~ macro
 
-A natural next question: can we write ~(var obj)~ where ~var~ holds a
-keyword, integer, or string at runtime?  The answer is /no/ — and the
-reason is fundamental.
+The walker is deliberately literal-only.  A natural next question: what
+about ~(var obj)~ where ~var~ holds a keyword, integer, or string at
+runtime?  For that case we offer an explicit macro: ~easy-access~.
 
-*The problem.* At read-time the walker sees ~(var obj)~.  Is ~var~ a
-function being called on ~obj~ (standard Elisp), or a variable holding an
-accessor key?  The walker cannot tell — both are syntactically identical.
-Keywords, integers, and strings are unambiguous because they are /never/
-valid function names: ~(:foo p)~ and ~(3 xs)~ error in stock Elisp, so
-claiming them as accessors changes nothing that previously worked.  A bare
-symbol like ~var~ is already a valid function call.
+There is a second, independent reason to reach for it: the stock Elisp
+accessors have /inconsistent argument orders/.  Half take the key
+first, half take the collection first — and the reader has to
+remember which is which:
 
-*A proposed solution.* The walker could rewrite /every/ ~(sym arg)~ form
-to a runtime dispatch:
+#+begin_src emacs-lisp
+  (alist-get 'y '((x . 1) (y . 2)))            ;; key then collection
+  (plist-get '(:a 1 :b 2 :c 3) :b)             ;; collection then key
+  (gethash 'x #s(hash-table data (x 1 y 2)))   ;; key then collection
+  (aref [1 2 3] 0)                             ;; collection then key
+  (elt "1234" 2)                               ;; collection then key
+#+end_src
+
+~easy-access~ collapses all five into a single, always-the-same shape:
+
+#+begin_src emacs-lisp
+  (easy-access KEY COLL)   ;; every time.  key first, collection last.
+#+end_src
+
+~(easy-access K₀ K₁ … Kₙ COLL)~ evaluates each ~Kᵢ~ as an ordinary
+Elisp expression and folds left-to-right over ~easy-access-lookup~ —
+the same fold the walker produces for literal keys, so the explicit
+form agrees exactly with ~(K₀ K₁ … COLL)~ when every key is a literal.
+
+#+begin_src emacs-lisp
+  ;; Runtime-computed key (from an `intern' call):
+  (let ((kind 'b))
+    (easy-access (intern (symbol-name kind))
+                 '(a ?A b ?B c ?C)))       ;; ⟹ ?B
+
+  ;; Variable string key against an alist (dispatches via `assoc'):
+  (let ((btn  "button one")
+        (handlers '(("button one" . one-handler)
+                    ("button two" . two-handler))))
+    (easy-access btn handlers))            ;; ⟹ one-handler
+
+  ;; Chained: outer then inner key, both variables:
+  (let ((outer 'user) (inner :name))
+    (easy-access outer inner
+                 '((user . (:name "Fatima")) (role . (:name "admin")))))
+  ;; ⟹ "Fatima"
+#+end_src
+
+This is the macro form of the table in /One syntax, every container/:
+a /single/ accessor spelling that replaces ~plist-get~, ~alist-get~,
+~gethash~, ~nth~, ~aref~, and the various struct accessors — whenever
+the key is runtime-computed.  Dispatch still happens through the rules
+registry, so the same ~(easy-access KEY COLL)~ works against a plist,
+an alist, a hash table, a vector, a string, or a struct, chosen at
+runtime by the shape of ~COLL~ and the type of ~KEY~.  ~setf~ on the
+macro form works too, since ~gv-define-setter~ is registered on
+~easy-access-lookup~.
+
+*Why not extend the walker to do this?*  The walker would have to
+rewrite /every/ ~(sym arg)~ form into a runtime dispatch:
 
 #+begin_src emacs-lisp
   ;; Hypothetical rewrite of (var obj):
@@ -466,11 +644,13 @@ to a runtime dispatch:
       (funcall var obj)))
 #+end_src
 
-*Why we reject it.* This would intercept /every/ single-argument function
-call in the entire codebase — ~(message "hi")~, ~(car xs)~, ~(1+ n)~ —
-adding a runtime branch to each.  The performance cost is excessive for an
-edge case.  Worse, special forms and macros are not ~funcall~-able, so
-the fallback path would break on ~(if cond)~, ~(quote x)~, etc.
+which would intercept /every/ single-argument call in the codebase —
+~(message "hi")~, ~(car xs)~, ~(1+ n)~ — adding a runtime branch to
+each, and breaking outright on special forms and macros (~(if cond)~,
+~(quote x)~, …) that are not ~funcall~-able.  The macro makes the
+intent explicit at the call site for the vanishingly small set of
+places that actually need it — the right trade-off for both clarity
+and performance.
 
 * Extending — ~defcall~ as ~defgeneric~ for function application
 
@@ -525,7 +705,7 @@ byte-compilation, and the mode-toggle semantics all continue to work
 unchanged — the extension point is the /only/ thing that changed.
 
 *Note:* ~easy-access~ ships a built-in ~strings-as-accessors~ rule that
-claims strings for alist/hash-table lookup (see [[*String keys][String keys]]).
+claims strings for alist/plist/hash-table lookup (see [[*String keys][String keys]]).
 To use the regex example above instead, override the built-in rule
 ---or compose both by dispatching on the target type (string target
 → regex, collection target → lookup).
@@ -558,6 +738,92 @@ Flat predicates (~integerp~, ~keywordp~, ~stringp~, …) are mostly
 disjoint in practice, so overlap is rare.  When it happens, "last
 declared wins" is the predictable behaviour.
 
+** Companion — ~defcall-rewrite~ for special forms
+
+~defcall~ extends the set of /accessor-key shapes/ the walker recognises
+— integers, keywords, quoted symbols, strings, and whatever else a
+user registers.  Its companion, ~defcall-rewrite~, extends the set of
+/special-form shapes/ the walker knows how to descend into.  Where
+~defcall~ teaches the walker a new /leaf/ rule, ~defcall-rewrite~
+teaches it a new /branch/ rule — how to recurse selectively into a
+compound form's sub-expressions.
+
+*This should be a rarity.*  Ordinary macros — ~-when-let~, ~-if-let~,
+~--map~, ~->~, ~->>~, ~doto~, ~use-package~, and the like — need no
+intervention.  The walker has a general policy: if ~(macrop HEAD)~
+is true and no earlier branch has claimed the form, the walker
+~macroexpand~s it and walks the result.  The expansion is ordinary
+Lisp — ~let~, ~if~, ~lambda~, ~progn~ — all of which the walker
+already handles, so accessor forms nested /inside/ a macro call are
+rewritten correctly after expansion.  You only reach for
+~defcall-rewrite~ when a form /cannot/ be macroexpanded — i.e. it is
+a true special form, or a macro whose expansion hides a binding
+position the walker must not walk into.  That set is small and
+mostly closed; core already covers it.
+
+*** Syntax
+
+#+begin_src emacs-lisp
+  (defcall-rewrite NAME DOCSTRING
+    :source (HEAD pat₁ pat₂ … . rest)
+    :target (HEAD tpl₁ tpl₂ … . rest))
+#+end_src
+
+- ~:source~ — a destructuring pattern.  The first element is the form's
+  HEAD (matched ~eq~).  Plain symbols are binders.  A native Lisp
+  dotted tail ~. rest~ binds the remaining sub-forms as a list.
+- ~:target~ — a template.  Emitted verbatim, with three markers
+  directing walking:
+  - ~(rewrite! X)~ → walk one sub-form.
+  - ~(rewrite-each! XS)~ → walk each element of a list binding.
+  - Anything else → emit verbatim (captured binders substitute in
+    place).  Absence of a ~rewrite…~ wrapper /is/ the signal to keep
+    verbatim — there is no ~keep!~ marker.
+
+Rewrites are returned as-is; the walker does not re-walk its own
+output.  Re-entry happens only through explicit ~rewrite!~ /
+~rewrite-each!~ markers — so you control exactly which sub-forms are
+descended into.
+
+*** Worked example — ~define-advice~
+
+~define-advice~ is a special form that takes ~(FN NAME-SPEC
+ BODY…)~, where ~NAME-SPEC~ is a data descriptor that must not be
+walked — it contains the advice's name and combinator keyword — and
+~BODY…~ is code.  The built-in rewrite reads:
+
+#+begin_src emacs-lisp
+  (defcall-rewrite define-advice-rewrite
+    "Skip the name-spec; rewrite only the body forms."
+    :source (define-advice fn name-spec . body)
+    :target (define-advice fn name-spec (rewrite-each! body)))
+#+end_src
+
+Three binders — ~fn~, ~name-spec~, and the rest-binder ~body~.  ~fn~
+and ~name-spec~ are emitted verbatim; ~body~ is walked element-wise.
+
+*** Registration semantics
+
+Like ~defcall~: push-to-front registry, most-recent-wins.
+Re-evaluating a ~defcall-rewrite~ form upserts in place and promotes
+the entry to the front.  ~easy-access-remove-rewrite~ is the
+inverse, for cleanup.  Validation at macro-expansion time: every
+binder named in ~:target~ must appear in ~:source~, otherwise the
+definition errors out — bad patterns fail loudly at definition, not
+silently at walk time.
+
+*** What belongs in ~defcall-rewrite~ vs. a regular macro
+
+| Shape                                              | Where it belongs                        |
+|----------------------------------------------------+-----------------------------------------|
+| Ordinary macro (~-when-let~, ~use-package~, ~->~)  | Nowhere — generic macroexpand handles it |
+| Special form with a data-position sub-form         | ~defcall-rewrite~                       |
+| Special form with variable-length / shape-sensitive bindings | Imperative branch in the walker — e.g. ~let~ / ~let*~ / ~cl-defmethod~ |
+
+In short: if the form macroexpands cleanly into ordinary Lisp, leave
+it alone — the walker will do the right thing.  Reach for
+~defcall-rewrite~ only when it doesn't.
+
 ** Walker-path prohibition — no ~cl-*~ / ~seq-*~ in rule guards
 
 ~:when~ predicates run inside ~load-read-function~, the same hook
@@ -589,14 +855,15 @@ canonicalisation and may use whatever they like.
   emacs --batch -L . -l easy-access-tests.el -f ert-run-tests-batch-and-exit
 #+end_src
 
-Eighty-three tests cover walk correctness, runtime dispatch,
-end-to-end evaluation through ~eval~ and ~load~, interactive
-evaluation simulation, regression against stock Elisp idioms,
-mode-toggle symmetry, ~setf~ on every container type, threading
-macros, byte-compilation, ~defcall~ extensibility (user-defined rules,
+The suite covers walk correctness, runtime dispatch, end-to-end
+evaluation through ~eval~ and ~load~, interactive evaluation
+simulation, regression against stock Elisp idioms, mode-toggle
+symmetry, ~setf~ on every container type, threading macros,
+byte-compilation, ~defcall~ extensibility (user-defined rules,
 most-recent-wins resolution, ~:read-key~ canonicalisation), a
-recursive-load guard for the walker path, and negative / out-of-bounds
-integer indexing.
+recursive-load guard for the walker path, negative / out-of-bounds
+integer indexing, and the ~easy-access~ macro for runtime-computed
+keys.
 
 * License
 

@@ -1,5 +1,5 @@
 EMACS ?= emacs
-BATCH := $(EMACS) --batch -L .
+BATCH := $(EMACS) --batch --eval '(package-initialize)' -L . -L ~/snap
 
 .PHONY: all compile test clean
 
