@@ -38,6 +38,9 @@ jobs:
       - name: Byte-compile
         run: |
           emacs --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
             -L . \
             -L snap \
             -f batch-byte-compile \
