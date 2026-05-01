@@ -46,13 +46,14 @@
 {\textcolor{black!44} \hrule}
 \vspace{1em}
 
-\centering{\texttt{ (:school 'math "jasim" 1 my-nested-life) }}
+\centering{\texttt{ (:school 'math "jasim" :names 2 my-nested-life) }}
 \\[1em] \textcolor{black!80}{replaces}
 \\[1em] {\small \textcolor{black!70}{\texttt{(seq-elt (->  my-nested-life
       \\ \hspace{7em} (map-elt :school)
       \\ \hspace{6em} (map-elt 'math)
-      \\ \hspace{7.5em} (map-elt "jasim"))
-      \\ \hspace{-3em}1)}}}
+      \\ \hspace{7.1em} (map-elt "jasim")
+      \\ \hspace{5.5em} person-names)
+      \\ \hspace{-3em}2)}}}
 % \vspace{1em}
 \\{\color{white} Bye!}
 #+end_src
@@ -66,19 +67,6 @@
 #+html:   </a>
 #+html: </p>
 
-#+begin_comment Complicated_threading
-#+begin_src emacs-lisp
-(equal
- (:school 'math "jasim" 1 (alist :school (list 'math (hash-map "jasim" [a b]))))
- (seq-elt (-> (alist :school (list 'math (hash-map "jasim" [a b])))
-             (map-elt :school)
-             (map-elt 'math)
-             (map-elt "jasim")
-             )
-          1)) 
-#+end_src
-#+end_comment
- 
 #+begin_comment tldr
  What works:
   - (:key plist) — plist lookup
@@ -116,20 +104,31 @@ we wrote ~(nth 3 seq)~, we write ~(3 seq)~; where we had a struct like
 ~(cl-defstruct pair first second)~ and wrote ~(pair-first p)~, we write
 ~(:first p)~.
 
-The savings compound.  A deeply-nested access that used to look like
-
+The savings compound. For example, suppose we have a complicated object like:
 #+begin_src emacs-lisp
-  (plist-get (nth 3 (plist-get obj :children)) :label)
+(cl-defstruct person () names) ;; A person can have multiple names
+
+(setq my-nested-life '((:school math #s(hash-table test equal data ("jasim" #s(person nil (Jimmy J Jameson)))))))
+;; ≈ JavaScript: {school: {math: {jasim: {names: [Jimmy, J, Jameson] }}}}
 #+end_src
 
-becomes, in due time,
-
+Then the deeply-nested access that used to look like
 #+begin_src emacs-lisp
-  (:children 3 :label obj)
+(seq-elt (-> my-nested-life         
+             (map-elt :school)
+             (map-elt 'math)
+             (map-elt "jasim")
+             person-names)
+         2))
+#+end_src
+Becomes
+#+begin_src emacs-lisp 
+(:school 'math "jasim" :names 2 my-nested-life) ;; 😍 NEW Syntax
 #+end_src
 
-Path-first, left-to-right — /:children/, then /3rd/, then /:label/ —
-same reading order as Clojure's ~get-in~ and ~->~.
+Aside: ~my-nested-life~ was actually constructed using ~(alist :school (list 'math
+(hash-map "jasim" (make-person :names '(Jimmy J Jameson)))))~, keep reading to
+learn more!
 
 * One syntax, every container
 

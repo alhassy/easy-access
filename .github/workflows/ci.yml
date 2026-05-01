@@ -25,6 +25,16 @@ jobs:
           repository: alhassy/snap
           path: snap
 
+      - name: Install snap.el dependencies
+        run: |
+          emacs --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 's)" \
+            --eval "(package-install 'magit)"
+
       - name: Byte-compile
         run: |
           emacs --batch \
@@ -36,6 +46,9 @@ jobs:
       - name: Run ERT tests
         run: |
           emacs --batch \
+            --eval "(require 'package)" \
+            --eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
+            --eval "(package-initialize)" \
             -L . \
             -L snap \
             -l easy-access-tests.el \
