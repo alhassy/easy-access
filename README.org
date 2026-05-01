@@ -66,7 +66,7 @@
 #+html:   </a>
 #+html: </p>
 
-:Complicated_threading: 
+#+begin_comment Complicated_threading
 #+begin_src emacs-lisp
 (equal
  (:school 'math "jasim" 1 (alist :school (list 'math (hash-map "jasim" [a b]))))
@@ -77,7 +77,7 @@
              )
           1)) 
 #+end_src
-:End:
+#+end_comment
  
 #+begin_comment tldr
  What works:

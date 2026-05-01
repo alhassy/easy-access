@@ -963,6 +963,10 @@ handler."
                         easy-access--rewrites))
     (/= before (length easy-access--rewrites))))
 
+(eval-and-compile
+;; These helpers are called inside the `defcall-rewrite' macro body, so
+;; they must be available at both compile time and runtime.
+
 (defun easy-access--source-head (source)
   "Return the head symbol of SOURCE (a `defcall-rewrite' source pattern).
 The head is the first element and must be a non-keyword symbol.
@@ -1138,6 +1142,8 @@ source pattern's binders."
           (setq tail (cdr tail)))
         (when tail (arg tail))))
     (delete-dups (nreverse syms))))
+
+) ; end eval-and-compile
 
 (defmacro defcall-rewrite (name &rest spec)
   "Declare a walker rewrite NAME for a macro or special-form shape.
