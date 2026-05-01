@@ -1,0 +1,42 @@
+name: easy-access CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@v8.0
+        with:
+          version: 30.1
+
+      - name: Check out snap.el (test fixture library)
+        uses: actions/checkout@v4
+        with:
+          repository: alhassy/snap
+          path: snap
+
+      - name: Byte-compile
+        run: |
+          emacs --batch \
+            -L . \
+            -L snap \
+            -f batch-byte-compile \
+            easy-access.el easy-access-tests.el
+
+      - name: Run ERT tests
+        run: |
+          emacs --batch \
+            -L . \
+            -L snap \
+            -l easy-access-tests.el \
+            -f ert-run-tests-batch-and-exit

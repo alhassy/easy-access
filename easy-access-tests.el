@@ -1511,5 +1511,74 @@ body errors out mid-way."
      '(pcase-lambda (`(,a ,b))
         (:name a))))))
 
+;;; -------------------------------------------------------------------------
+;;; Group 21 -- Integer keys on hash-tables, alists, and plists
+;;; -------------------------------------------------------------------------
+;;;
+;;; An integer in CAR position should dispatch to the associative
+;;; container rules (gethash / assq / plist-get) whenever the target is
+;;; a hash-table, alist, or integer-keyed plist -- not only when it is a
+;;; sequence.
+
+(defvar easy-access-tests--int-key-hash nil "Fixture for integer-key hash setf.")
+(defvar easy-access-tests--int-key-alist nil "Fixture for integer-key alist setf.")
+
+(deftest "integer-key-hash-read -- integer key dispatches via gethash"
+  (let ((h (make-hash-table :test 'eql)))
+    (puthash 0 "zero" h)
+    (puthash 1 "one" h)
+    (puthash 42 "forty-two" h)
+    (should (equal "zero"      (easy-access-lookup h 0)))
+    (should (equal "one"       (easy-access-lookup h 1)))
+    (should (equal "forty-two" (easy-access-lookup h 42)))
+    (should (null              (easy-access-lookup h 99)))))
+
+(defaccesstest "integer-key-hash-e2e -- bare (N hash-table) reaches eval"
+  (let ((h (make-hash-table :test 'eql)))
+    (puthash 7 "seven" h)
+    (should (equal "seven" (eval `(7 ,h) t)))))
+
+(defaccesstest "integer-key-hash-setf -- (setf (N hash) v) is a puthash"
+  (setq easy-access-tests--int-key-hash (make-hash-table :test 'eql))
+  (puthash 1 "old" easy-access-tests--int-key-hash)
+  (eval '(setf (1 easy-access-tests--int-key-hash) "new") nil)
+  (should (equal "new" (gethash 1 easy-access-tests--int-key-hash)))
+  ;; New key via setf.
+  (eval '(setf (2 easy-access-tests--int-key-hash) "two") nil)
+  (should (equal "two" (gethash 2 easy-access-tests--int-key-hash))))
+
+(deftest "integer-key-alist-read -- integer key dispatches via assq+cdr"
+  (let ((al '((0 . "zero") (1 . "one") (42 . "forty-two"))))
+    (should (equal "zero"      (easy-access-lookup al 0)))
+    (should (equal "one"       (easy-access-lookup al 1)))
+    (should (equal "forty-two" (easy-access-lookup al 42)))
+    (should (null              (easy-access-lookup al 99)))))
+
+(defaccesstest "integer-key-alist-e2e -- bare (N alist) reaches eval"
+  (should (equal "one"
+                 (eval '(1 '((0 . "zero") (1 . "one"))) t))))
+
+(defaccesstest "integer-key-alist-setf -- (setf (N alist) v) mutates the pair"
+  (setq easy-access-tests--int-key-alist
+        (list (cons 0 "zero") (cons 1 "one")))
+  (eval '(setf (0 easy-access-tests--int-key-alist) "naught") nil)
+  (should (equal "naught" (cdr (assq 0 easy-access-tests--int-key-alist))))
+  (should (equal "one"    (cdr (assq 1 easy-access-tests--int-key-alist)))))
+
+(deftest "integer-key-does-not-confuse-sequence -- list-of-cons is alist not indexed"
+  ;; A list whose CAR is a cons cell is an alist; (0 al) dispatches
+  ;; to assq, NOT nth.  This guards the heuristic boundary.
+  (let ((al '((0 . "zero") (1 . "one"))))
+    (should (equal "zero" (easy-access-lookup al 0)))
+    ;; nth 0 of the alist would be (0 . "zero"), a cons -- that is NOT
+    ;; what we get; we get the CDR of the matching pair.
+    (should-not (consp (easy-access-lookup al 0)))))
+
+(deftest "integer-key-sequence-unaffected -- plain list still uses nth"
+  ;; Regression: a plain list (no cons CARs) must still index by position.
+  (should (equal 'b (easy-access-lookup '(a b c) 1)))
+  (should (equal 'a (easy-access-lookup '(a b c) 0)))
+  (should (equal 'c (easy-access-lookup '(a b c) 2))))
+
 (provide 'easy-access-tests)
 ;;; easy-access-tests.el ends here

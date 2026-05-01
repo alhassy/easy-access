@@ -533,9 +533,13 @@ rebound, which the gv-setter does not do."
 
 (defcall integers-as-accessors (head target &optional value)
   :when (integerp head)
-  "Integers in CAR position index into sequences; `setf'-able.
-Dispatches to `nth' / `elt' for reads and `setcar'+`nthcdr' /
-`aset' for writes.  Strings are read-only -- no `setf' branch.
+  "Integers in CAR position index into sequences or associative containers; `setf'-able.
+For sequences, dispatches to `nth' / `elt' for reads and
+`setcar'+`nthcdr' / `aset' for writes.  Strings are read-only.
+
+For hash-tables, alists, and plists keyed by integers, dispatches
+to `gethash', `assq'+`cdr', and `plist-get' respectively -- the
+same rules as `keywords-as-accessors'.
 
 Negative indices count from the end, Python-style: -1 is the
 last element, -2 the second-to-last, and so on.  So
@@ -548,31 +552,41 @@ lists, vectors, and strings -- matching `nth's lenient behaviour
 rather than `elt's `args-out-of-range' signal.  Writes past the
 end still error (via `aset' / `setcar' on a too-short tail), as
 clobbering a non-existent index has no sensible meaning."
-  (let* ((len (cond ((listp target) (length target))
-                    ((sequencep target) (length target))
-                    (t 0)))
-         ;; Python-style negative indexing: -k ↦ len + (-k).  In-bounds
-         ;; negatives land at ≥ 0; out-of-bounds negatives (e.g. -99 on
-         ;; a 3-sequence) stay negative, so the downstream bounds check
-         ;; still catches them.
-         (idx (if (< head 0) (+ len head) head)))
-    (cond
-     ((listp target)
-      (if (easy-access-setting-p)
-          (easy-access--list-index-set target idx value)
-        (and (>= idx 0) (< idx len)
-             (nth idx target))))
-     ((vectorp target)
-      (if (easy-access-setting-p)
-          (aset target idx value)
-        (and (>= idx 0) (< idx len)
-             (elt target idx))))
-     ((sequencep target)                  ; strings etc.
-      (if (easy-access-setting-p)
-          (signal 'easy-access-invalid-key (list head target))
-        (and (>= idx 0) (< idx len)
-             (elt target idx))))
-     (t (signal 'easy-access-invalid-key (list head target))))))
+  (cond
+   ((hash-table-p target)
+    (if (easy-access-setting-p)
+        (puthash head value target)
+      (gethash head target)))
+   ((easy-access--alistp target)
+    (if (easy-access-setting-p)
+        (easy-access--alist-set target head value)
+      (cdr (assq head target))))
+   (t
+    (let* ((len (cond ((listp target) (length target))
+                      ((sequencep target) (length target))
+                      (t 0)))
+           ;; Python-style negative indexing: -k ↦ len + (-k).  In-bounds
+           ;; negatives land at ≥ 0; out-of-bounds negatives (e.g. -99 on
+           ;; a 3-sequence) stay negative, so the downstream bounds check
+           ;; still catches them.
+           (idx (if (< head 0) (+ len head) head)))
+      (cond
+       ((listp target)
+        (if (easy-access-setting-p)
+            (easy-access--list-index-set target idx value)
+          (and (>= idx 0) (< idx len)
+               (nth idx target))))
+       ((vectorp target)
+        (if (easy-access-setting-p)
+            (aset target idx value)
+          (and (>= idx 0) (< idx len)
+               (elt target idx))))
+       ((sequencep target)               ; strings etc.
+        (if (easy-access-setting-p)
+            (signal 'easy-access-invalid-key (list head target))
+          (and (>= idx 0) (< idx len)
+               (elt target idx))))
+       (t (signal 'easy-access-invalid-key (list head target))))))))
 
 (defcall keywords-as-accessors (head target &optional value)
   :when (keywordp head)
@@ -1386,7 +1400,14 @@ walking code sub-forms."
 (defun easy-access--walk-backquote (form)
   "Walk a backquote template FORM.
 Only unquoted sub-expressions are walked; the template skeleton
-is preserved verbatim."
+is preserved verbatim.
+
+Iterates across the list spine with a plain loop instead of
+recursing `(cons (walk car) (walk cdr))' --- agda-input's giant
+translation table is a single backquoted cons-chain thousands of
+cells long, and a recursive cdr walk overflows `max-lisp-eval-depth'
+on it.  We still recurse into each element (so nested unquotes are
+walked), but the spine itself is traversed iteratively."
   (cond
    ((atom form) form)
    ((eq (car-safe form) '\,)
@@ -1394,8 +1415,22 @@ is preserved verbatim."
    ((eq (car-safe form) '\,@)
     (list '\,@ (easy-access-walk (cadr form))))
    ((consp form)
-    (cons (easy-access--walk-backquote (car form))
-          (easy-access--walk-backquote (cdr form))))
+    (let ((out nil)
+          (cur form))
+      (while (consp cur)
+        (let ((head (car cur)))
+          (push (cond
+                 ((atom head) head)
+                 ((eq (car-safe head) '\,)
+                  (list '\, (easy-access-walk (cadr head))))
+                 ((eq (car-safe head) '\,@)
+                  (list '\,@ (easy-access-walk (cadr head))))
+                 (t (easy-access--walk-backquote head)))
+                out))
+        (setq cur (cdr cur)))
+      ;; CUR is now the (possibly non-nil) dotted tail.  Walk it too.
+      (let ((tail (if (null cur) nil (easy-access--walk-backquote cur))))
+        (nconc (nreverse out) tail))))
    (t form)))
 
 ;;; -------------------------------------------------------------------------

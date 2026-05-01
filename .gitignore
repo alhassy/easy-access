@@ -1,3 +1,5 @@
 *.elc
 .#*
 *~
+/easy-access-overview.pdf
+/easy-access-overview.tex

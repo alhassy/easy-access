@@ -1,7 +1,84 @@
 #+TITLE: easy-access — Clojure-style accessors for Emacs Lisp
 #+AUTHOR: Musa Al-hassy
 #+OPTIONS: toc:2
+ 
+# Render diagram: (progn (use-package ob-latex-as-png :ensure t)
+#                        (add-hook 'org-babel-after-execute-hook 'org-redisplay-inline-images))
+#+begin_src latex-as-png :file easy-access-overview.png :resolution "720" :results raw value replace :exports results
+\usepackage{smartdiagram}
+\usepackage{graphicx}
+% in 
+\vspace{1.5em}
+\centering{One syntax \texttt{(key map)} \\ where \texttt{key} is \texttt{number, :keyword, 'symbol, "string"}!}
 
+\vspace{1em}
+\smartdiagramset{
+  planet color=black!75,
+  planet size=3.5cm,
+  planet font=\normalfont\bfseries\normalsize,
+  satellite size=3.6cm,
+  satellite font=\normalfont\small,
+  satellite text width=3.5cm,
+  distance planet-satellite=5.7cm,
+  connection color=gray!60,
+  connection line width=0.06cm,
+  text color=black,
+  font=\small\sffamily
+}
+\newcommand{\new}[1]{{\large \texttt{\mbox{#1}}}}
+\newcommand{\replaces}{\\[1em]\textcolor{black!80}{replaces}\vspace{0em}}
+\newcommand{\andAlso}{\\\textcolor{black!80}{and}\vspace{-1em}}
+\newcommand{\old}[1]{\\[1em]\textcolor{black!70}{\texttt{\mbox{#1}}}}
+\resizebox{1.0\textwidth}{!}{%
+\smartdiagram[constellation diagram]{%
+  {\color{white}\mbox{\hspace{-2em}\LARGE\texttt{easy-access.el}}\\[1em]\mbox{one syntax}},
+  \new{(:k plist)} \replaces \old{(plist-get plist :k)},
+  \new{(:k alist)} \replaces \old{(cdr (assoc :k alist))},
+  \new{(:k hash)} \replaces \old{(gethash :k hash)},
+  \new{(:field instance)} \replaces \old{\hspace{-.4em}(record-field instance)},
+  \new{($n$ sequence)} \replaces \old{(seq-elt sequence $n$)},
+  % \new{(N xs)} \replaces \old{Inconsistent arg order!}\vspace{-1em}\old{(nth N xs)}\andAlso{}\old{(aref xs N)},a
+  % \new{(setf (:k m) v)} \old{Inconsistent arg order!}\vspace{-1em}\old{(plist-put m :k v)}\vspace{-1em}\old{(puthash :k v m)}
+  \new{(setf (:k p) v)} \replaces \old{(map-put p :k v)}\andAlso{}\old{(setf (seq-elt p k) v)}
+}} % end \resizebox + \smartdiagram
+
+\vspace{1em}
+{\textcolor{black!44} \hrule}
+\vspace{1em}
+
+\centering{\texttt{ (:school 'math "jasim" 1 my-nested-life) }}
+\\[1em] \textcolor{black!80}{replaces}
+\\[1em] {\small \textcolor{black!70}{\texttt{(seq-elt (->  my-nested-life
+      \\ \hspace{7em} (map-elt :school)
+      \\ \hspace{6em} (map-elt 'math)
+      \\ \hspace{7.5em} (map-elt "jasim"))
+      \\ \hspace{-3em}1)}}}
+% \vspace{1em}
+\\{\color{white} Bye!}
+#+end_src
+
+#+RESULTS:
+[[file:easy-access-overview.png]]
+
+#+html: <p align="center">
+#+html:   <a href="https://github.com/alhassy/easy-access/actions?query=workflow%3A%22easy-access+CI%22">
+#+html:     <img src="https://github.com/alhassy/easy-access/workflows/easy-access%20CI/badge.svg" alt="easy-access Tests Pass">
+#+html:   </a>
+#+html: </p>
+
+:Complicated_threading: 
+#+begin_src emacs-lisp
+(equal
+ (:school 'math "jasim" 1 (alist :school (list 'math (hash-map "jasim" [a b]))))
+ (seq-elt (-> (alist :school (list 'math (hash-map "jasim" [a b])))
+             (map-elt :school)
+             (map-elt 'math)
+             (map-elt "jasim")
+             )
+          1)) 
+#+end_src
+:End:
+ 
 #+begin_comment tldr
  What works:
   - (:key plist) — plist lookup
@@ -12,6 +89,8 @@
   - (:key hash-table) / ('sym hash-table) — gethash fallback
   - (N seq) — nth/elt into lists, vectors, strings; negative N counts
     from the end; (-1 xs) = last element; out-of-bounds reads return nil
+  - (N hash) / (N alist) — integer keys on hash-tables and alists work
+    exactly like keyword keys: gethash / assq+cdr, fully setf-able
   - (:a 'b N "str" obj) — left-to-right chained access, arbitrary depth,
     freely mixing key shapes and crossing container types
   - C-x C-e, C-M-x, M-: on bare accessor forms
@@ -31,7 +110,7 @@
 
 * What & Why
 
-We bring Clojure's terse accessor syntax to Emacs Lisp.  Concretely — where
+We bring [[https://alhassy.com/ClojureCheatSheet/CheatSheet.pdf][Clojure]]'s terse accessor syntax to Emacs Lisp.  Concretely — where
 we once wrote ~(plist-get user :name)~, we now write ~(:name user)~; where
 we wrote ~(nth 3 seq)~, we write ~(3 seq)~; where we had a struct like
 ~(cl-defstruct pair first second)~ and wrote ~(pair-first p)~, we write
@@ -75,6 +154,8 @@ depends on the container — which the reader has to carry in their head.
 | List (by index)    | ~(nth 2 xs)~                 | ~(setcar (nthcdr 2 xs) v)~     | ~(2 xs)~       |
 | Vector (by index)  | ~(aref v 2)~                 | ~(aset v 2 val)~               | ~(2 v)~        |
 | String (by index)  | ~(aref s 2)~                 | —                              | ~(2 s)~        |
+| Hash (integer key) | ~(gethash 2 h)~              | ~(puthash 2 v h)~              | ~(2 h)~        |
+| Alist (integer key)| ~(cdr (assq 2 a))~           | ~(setcdr (assq 2 a) v)~        | ~(2 a)~        |
 | Alist (string key) | ~(cdr (assoc "k" a))~        | ~(setcdr (assoc "k" a) v)~     | ~("k" a)~      |
 | Plist (string key) | ~(plist-get p "k" #'equal)~  | ~(plist-put p "k" v #'equal)~  | ~("k" p)~      |
 | Hash (string key)  | ~(gethash "k" h)~            | ~(puthash "k" v h)~            | ~("k" h)~      |
@@ -191,6 +272,61 @@ tail (a list), while ~(1 xs)~ returns the second /element/.  Chained
 ~0~'s, but mixed ~car~/~cdr~ towers like ~(cadar x)~ don't reduce
 further — use ~nth~ or destructuring instead.
 
+*** DIY Example:: Python-style splicing via keyword syntax
+
+[[https://alhassy.com/PythonCheatSheet/CheatSheet.pdf][Python]] ships with terse slice notation.  We can approximate it in Emacs Lisp
+/without/ touching the walker, because colon introduces keywords and ~easy-access~
+only rewrites /literals/ — so we can embed literal indices directly into a keyword
+name.
+
+Use ~:start:end:step~ to get every ~step~-th item from ~start~ up to ~end~ (inclusive), with
+~-𝓃~ meaning the 𝓃-th item from the end:
+#+begin_src emacs-lisp
+(:1:-2 "hello, world")                  ;; ⇒ "ello, worl"
+(:4:   "hello, world")                  ;; ⇒ "o, world", since :4: ≡ :4:-1:1
+(:4:4: "hello, world")                  ;; ⇒ "o"
+(:0:6:2 [h₀ e₁ l₂ l₃ o₄ w₅ o₆ r₇ l₈ d₉]) ;; ⇒  [h₀ l₂ o₄ o₆]
+(:3:7 '(h₀ e₁ l₂ l₃ o₄ w₅ o₆ r₇ l₈ d₉))  ;; ⇒ '(l₃ o₄ w₅ o₆ r₇)
+(:::3 '(h₀ e₁ l₂ l₃ o₄ w₅ o₆ r₇ l₈ d₉))  ;; ⇒ '(h₀ l₃ o₆ d₉), since :::3 ≡ :0:-1:3
+(:1:-1 1234)                            ;; ⇒ ERROR: Whoa buddo, splicing “(:1:-1 1234)” requires a sequence, not a “integer”!
+#+end_src
+
+A minimal implementation:
+#+begin_src emacs-lisp
+(defcall keyword-splice (slice sequence &optional _value)
+  :when (and (keywordp slice)
+             (string-match "^:\\(-?[0-9]*\\):\\(-?[0-9]*\\)\\(:\\([0-9]*\\)\\)?$"
+                           (symbol-name slice)))
+  "`:start:end:step' in CAR position slices SEQUENCE like in Python."
+  (let* ((seq-type (--> (type-of sequence)
+                        (cond ((equal it 'cons) 'list)
+                              ((member it '(vector string list)) it)
+                              (:otherwise (error "Whoa buddo, splicing “(%s %s)” requires a sequence, not a “%s”!"
+                                                 slice sequence it)))))
+         (max-len (length sequence)) ;; Could crash without the previous type-checking!
+         (start   (string-to-number (match-string 1 (symbol-name slice))))
+         (end (--> (match-string 2 (symbol-name slice))
+                   (if (string= it "") "-1" it)                           ;; slice  =  :start:
+                   (string-to-number it)
+                   (if (< it 0) (+ max-len it) it)))
+         (step  (--> (match-string 4 (symbol-name slice))
+                     (cond ((not it) 1)                                   ;; slice  =  :start:end
+                           ((string= it "") 1)                            ;; slice  =  :start:end:
+                           (:otherwise (max 1 (string-to-number it))))))) ;; slice  =  :start:end:step 
+    ;; (message-box "%s" (list :max-len max-len :start start :end end :step step)) ;; DEBUGGING
+    ;; The seq-into call is to ensure we extract subvectors/substrings/sub-X from vectors/strings/X, respectively.    
+    (seq-into (cl-loop for i from start to end by step collect (seq-elt sequence i)) seq-type)))
+#+end_src
+
+The key insight: The indices are /literals baked into the keyword name/, so the
+walker sees a plain keyword in CAR position — no new special-form handling
+needed.
+
+The same trick generalises to any literal syntax you'd like to smuggle in.
+Provided you're working with literals, the approach lets you introduce terse
+domain notation in a single ~defcall~ form — no changes to the walker or the
+runtime dispatcher.
+
 *** Out-of-bounds reads return ~nil~
 
 Out-of-bounds integer reads — positive or negative — yield ~nil~
@@ -265,6 +401,112 @@ a /cons cell/, not a bare keyword — and dispatches to ~assq~ + ~cdr~:
 
 Equivalent to ~(cdr (assq :name user))~.
 
+*** Alists vs. hash tables — different critters
+
+A natural question: Why use alists when hash tables exist?  Performance
+differences exist, but they rarely matter at Emacs scales.  The real answer is
+that they are /not the same kind of thing/.
+
+Go back to set theory: A function is a relation — a set of ordered pairs
+~(input, output)~ with no input appearing twice.  An alist is almost a
+direct encoding of that: A list of ~(key . value)~ cons cells.  The
+connection to ordinary list operations is not incidental — it is the
+point.  Everything you can do with a Lisp list you can do with an alist:
+~mapcar~, ~cl-remove-if~, ~seq-filter~, structural sharing via ~cons~,
+pattern-matching with ~pcase~.  None of that applies to a hash table,
+which is /only/ a map — a self-contained object with one comparison
+predicate and one value per key, full stop.
+
+This buys alists things hash tables cannot offer:
+
+- *Multimaps.* The same key may appear multiple times; ~assq~ finds the
+  first, but you can walk the whole list to collect all values.  An
+  Elisp hash table realises a mathematical function — one key, one value.
+- *Structural sharing.* ~(cons new-pair old-alist)~ creates a new "scope"
+  in O(1) without copying — the standard trick behind dynamic binding and
+  environment chains in interpreters.
+- *List operations for free.* Sorting, filtering, grouping, zipping —
+  the full ~seq~ / ~cl~ vocabulary applies directly.
+
+So the gradient is: Reach for an alist when the structure /is/ a list
+that you also want to look things up in.  Reach for a hash table when
+you want /only/ a scalable map with a fixed comparison predicate and
+O(1) amortised lookup.  ~easy-access~ makes the access syntax identical
+either way, so the choice is purely about data-structure semantics —
+not spelling.
+
+
+#+begin_details "An exploration into performance wrt retrivals"
+Checking how long it takes to access alists vs hashmaps? It seems 10+ items then
+might as well use a hashmap!
+#+begin_src emacs-lisp 
+(require 'cl-lib)
+(require 'map) ;; Emacs' built-in map.el
+
+(defmacro benchmark (&rest body)
+  "How long does it take to execute BODY?"
+  (declare (indent 0))
+  `(progn
+     (garbage-collect)
+     (let ((start (float-time)))
+       ,@body
+       (* 100000 (- (float-time) start)))))
+
+(defun benchmark-random-sets-then-retrivals (size retrivals)
+  "Create an alist and hash-map randomly of the given SIZE, then benchmark performing RETRIEVALS-many random accessors."
+  (let ((alist ())
+        (hash-map (make-hash-table :test 'eq)))
+
+    ;; for every i:0..n, key = random,
+    ;; Randomly populate the map “0..n → 0..n” where n = size. 
+    (cl-loop for value from 0 to size
+             for key = (cl-random size)
+             do (progn (push (cons key value) alist)
+                       (puthash key value hash-map)))
+
+    ;; Now retrieve random elements from the maps; how long does that take?
+    (cons
+     (benchmark (cl-loop for key from 0 to retrivals
+                         do (assq (% key size) alist)))
+     (benchmark (cl-loop for key from 0 to retrivals
+                         do (gethash (% key size) hash-map))))))
+
+
+
+(progn (insert "Size Retrievals AList     HashMap")
+       (cl-loop for size in '(1 10 30 100)
+                do (insert "\n---------------------------------")
+                (cl-loop for retrivals in '(1 10 30 100)
+                         for result = (benchmark-random-sets-then-retrivals size retrivals)
+                         do (insert (format "\n%-4d %-4d       %2f %2f" size retrivals (car result) (cdr result))))))
+
+(when nil
+  Size Retrievals AList     HashMap
+  ---------------------------------
+  1    1          0.500679 0.715256
+  1    10         0.786781 0.691414
+  1    30         0.810623 0.810623
+  1    100        1.502037 1.597404
+  --------------------------------- ;; ⟨ If you have at least 10 items, then hashmap is at least as good as alist if not better! ⟩
+  10   1          0.405312 0.309944
+  10   10         0.619888 0.691414 ;; ⇐ 😲 Roughly the same performance!
+  10   30         1.287460 0.905991
+  10   100        1.716614 1.597404
+  --------------------------------- ;; ⟨ If you have 30+ items, just use hash-map! ⟩
+  30   1          0.905991 0.500679
+  30   10         1.001358 0.905991
+  30   30         1.287460 1.001358
+  30   100        2.098083 1.692772
+  ---------------------------------
+  100  1          0.810623 0.405312
+  100  10         1.001358 0.691414
+  100  30         1.311302 0.810623
+  100  100        2.789497 2.002716
+  ) 
+#+end_src
+#+end_details
+
+
 ** String keys
 
 String literals in CAR position look up by ~equal~ association — the
@@ -325,25 +567,42 @@ is purely additive.
 The accessor dispatches via the generated ~point-label~ function.
 Struct-slot lookup is memoised, so repeated access is cheap.
 
-*** Structs are just named plists
+*** Structs are just named plists — and alists and hash-tables are the same story
 
-~easy-access~ blurs the distinction between plists and structs — they are
-accessed the exact same way and built almost the same way:
+~easy-access~ blurs the distinction between all four associative
+container types — they are accessed the exact same way and, with two
+small helpers, built almost the same way too.  Define:
 
 #+begin_src emacs-lisp
-  (cl-defstruct pair first second)          ;; Declare a "plist schema"
+  (defun hash-map (&rest keys-and-values)
+    "Create a hash-table from a plist of KEYS-AND-VALUES."
+    (map-into keys-and-values '(hash-table :test equal)))
 
-  (setq p1 (list      :first "me" :second "you")) ;; Creation
-  (setq p2 (make-pair :first "me" :second "you")) ;; Almost the same thing!
-
-  ;; Usage — identical!
-  (:first p1) ;; ⟹ "me"
-  (:first p2) ;; ⟹ "me"
+  (defun alist (&rest keys-and-values)
+    "Create an alist from a plist of KEYS-AND-VALUES."
+    (map-into keys-and-values 'list))
 #+end_src
 
-A struct is, in effect, a /named plist/ — a plist that carries a type tag.
-The only surface difference is whether you write ~(list ...)~ or
-~(make-pair ...)~ to construct one.
+Now construction across all four types looks nearly identical:
+
+#+begin_src emacs-lisp
+(cl-defstruct pair first second)     ;; Declare a "plist schema"
+
+(setq my-plist  (list      :first "me" :second "you"))
+(setq my-struct (make-pair :first "me" :second "you"))
+(setq my-alist  (alist     :first "me" :second "you"))
+(setq my-hash   (hash-map  :first "me" :second "you"))
+
+;; Usage — identical across all four!
+(:first my-plist)  ;; ⟹ "me"
+(:first my-struct) ;; ⟹ "me"
+(:first my-alist)  ;; ⟹ "me"
+(:first my-hash)   ;; ⟹ "me"
+#+end_src
+
+A struct is, in effect, a /named plist/ — a plist that carries a type tag.  The
+only surface difference is whether you write ~(list ...)~ or ~(make-pair ...)~ to
+construct one.
 
 But that type tag buys you two things a bare plist lacks:
 
@@ -356,14 +615,53 @@ But that type tag buys you two things a bare plist lacks:
   (cl-defmethod shout ((p pair))
     (format "I am %s and %s" (:first p) (:second p)))
 
-  (shout p2) ;; ⟹ "I am me and you"
-  (shout p1) ;; Error: no applicable method for (list ...)
+  (shout my-struct) ;; ⟹ "I am me and you"
+  (shout my-plist)  ;; Error: no applicable method for (list ...)
 #+end_src
 
 So the gradient is: plist (ad-hoc, zero ceremony) → struct (typed,
 predicate + methods).  ~easy-access~ makes the /read path/ identical,
 so you can start with a bare plist and promote to a struct later
 without rewriting any accessor call sites.
+
+*** COMMENT Maps as prototypes :Abandoned:Posterity:
+
+Taking the "callable map" idea one step further: what if ~my-alist~
+itself were callable as a constructor?  Since bare symbols in head
+position are ordinary function calls in Emacs Lisp, ~(my-alist :x 1
+:y 2)~ already /parses/ as a call to the function ~my-alist~.
+~defmap~ defines that function to mean "copy self, then merge the
+supplied overrides":
+
+#+begin_src emacs-lisp
+  (setq point (list :x 0 :y 0 :color "black"))
+  (defmap point) ;; ⟵ 💢 We'd need to do something like this to make the map callable!
+                 ;; Since easy-access.el's “defcall” requires “(f x)” that “f” be staticly determined!
+
+  (point :x 3)               ;; ⟹ (:x 3 :y 0 :color "black")
+  (point :x 1 :y 2)          ;; ⟹ (:x 1 :y 2 :color "black")
+  (point :color "red")        ;; ⟹ (:x 0 :y 0 :color "red")
+  point                       ;; ⟹ (:x 0 :y 0 :color "black")  — unchanged
+#+end_src
+
+Every map is simultaneously a value and a "class" — its defaults are
+inherited by every instance, and callers specialise only the slots they
+care about.  This is prototype-based inheritance: the map /is/ the
+prototype.  Works identically for alists and hash-tables:
+
+#+begin_src emacs-lisp
+  (setq defaults (alist :host "localhost" :port 5432 :db "prod"))
+  (defmap defaults)
+
+  (defaults :port 5433)       ;; ⟹ ((:db . "prod") (:port . 5433) (:host . "localhost"))
+  (defaults :db "staging" :port 5433)
+  ;; ⟹ ((:db . "staging") (:port . 5433) (:host . "localhost"))
+#+end_src
+
+New keys are added; existing keys are overridden; the original is
+never mutated.  For readers interested in pushing this pattern further
+— attaching methods, chains of delegation — [[https://nullprogram.com/blog/2013/04/07/][Prototype-based Elisp
+Objects with @]] is a delightful exploration of exactly that idea.
 
 ** Chained access
 
@@ -405,6 +703,29 @@ path just works:
     (0 :users 0 db))               ;; ⟹ "Ali"
     ;; (0 db) → alist → (:users) → vector → (0) → "Ali"
 #+end_src
+
+*** Associative structures as callable maps
+
+Associative structures — plists, alists, hash-tables — model finite
+functions: they map keys to values.  ~->~ lets us call them in exactly
+that spirit, threading the structure as the first argument and applying
+each key in turn:
+
+#+begin_src emacs-lisp
+  (setq students-to-grades '(:biology (:Jasim 72 :Kathy 44)
+                              :math    (:Jasim 27 :Kathy 88)))
+
+  (:biology :Jasim students-to-grades)      ;; ⟹ 72
+  (-> students-to-grades :biology :Jasim)   ;; ⟹ 72
+#+end_src
+
+Both spellings are identical in meaning — ~->~ is just more literal
+about the "call the map" reading.  If you find yourself doing this
+constantly and want to drop even the ~->~, a single ~defcall~ rule
+could make any alist or plist directly callable as its own function —
+the extension point is there precisely for patterns like this.  For
+further reading, [[https://kitchingroup.cheme.cmu.edu/blog/2017/04/16/A-callable-plist-data-structure-for-Emacs/][Kitchin's callable plist]] is a delightful exploration of
+exactly that idea.
 
 *** Threading and quoted symbols
 
@@ -517,7 +838,9 @@ rules (~integers-as-accessors~, ~keywords-as-accessors~,
 
 | Rule (CAR-shape guard)  | Target                           | Dispatch                |
 |-------------------------+----------------------------------+-------------------------|
-| /integer/               | list                             | ~nth~                   |
+| /integer/               | hash-table                       | ~gethash~               |
+| /integer/               | alist — /CAR is a cons cell/     | ~(cdr (assq k ...))~    |
+| /integer/               | list (plain)                     | ~nth~                   |
 | /integer/               | vector or string                 | ~elt~                   |
 | /keyword or plain sym/  | ~cl-defstruct~ instance (record) | generated slot accessor |
 | /keyword or plain sym/  | alist — /CAR is a cons cell/     | ~(cdr (assq k ...))~    |
