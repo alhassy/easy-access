@@ -557,7 +557,12 @@ clobbering a non-existent index has no sensible meaning."
     (if (easy-access-setting-p)
         (puthash head value target)
       (gethash head target)))
-   ((easy-access--alistp target)
+   ;; Only treat as an integer-keyed alist if the first entry's key is
+   ;; itself an integer.  A list like `((:a "deep"))' looks like an alist
+   ;; to `easy-access--alistp' (its CAR is a cons), but its keys are
+   ;; keywords -- integer indexing should use `nth', not `assq'.
+   ((and (easy-access--alistp target)
+         (integerp (caar target)))
     (if (easy-access-setting-p)
         (easy-access--alist-set target head value)
       (cdr (assq head target))))

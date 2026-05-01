@@ -1580,5 +1580,16 @@ body errors out mid-way."
   (should (equal 'a (easy-access-lookup '(a b c) 0)))
   (should (equal 'c (easy-access-lookup '(a b c) 2))))
 
+(deftest "integer-key-list-of-keyword-plists -- nth not assq when keys are non-integer"
+  ;; A list like `((:a "deep"))' satisfies `easy-access--alistp' (its CAR
+  ;; is a cons), but its alist keys are keywords, not integers.  Integer
+  ;; indexing must fall through to `nth', not `assq'.  This is the root
+  ;; cause of the `interactive-eval-last-sexp-chained' failure: indexing
+  ;; into a list-of-plists with an integer must yield the nth sub-plist,
+  ;; not nil from a failed `assq' lookup.
+  (let ((rows (list (list :a "deep") (list :a "shallow"))))
+    (should (equal (list :a "deep")    (easy-access-lookup rows 0)))
+    (should (equal (list :a "shallow") (easy-access-lookup rows 1)))))
+
 (provide 'easy-access-tests)
 ;;; easy-access-tests.el ends here
