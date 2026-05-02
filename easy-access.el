@@ -160,14 +160,11 @@ Works by checking a hidden lexical binding of
 Re-evaluating a `defcall' form promotes the rule to highest
 precedence (most recent wins) -- matches the user's editing
 workflow where re-evaluating means \"use my new definition.\""
-  (let ((name (easy-access-rule-name rule))
-        (acc nil)
-        (rest easy-access--rules))
-    (while rest
-      (unless (eq (easy-access-rule-name (car rest)) name)
-        (setq acc (cons (car rest) acc)))
-      (setq rest (cdr rest)))
-    (setq easy-access--rules (cons rule (nreverse acc))))
+  (let ((name (easy-access-rule-name rule)))
+    (setq easy-access--rules
+          (cl-delete-if (lambda (r) (eq (easy-access-rule-name r) name))
+                        easy-access--rules))
+    (push rule easy-access--rules))
   rule)
 
 (defun easy-access--matching-rule (head)
@@ -316,35 +313,47 @@ Example:
 
 (defvar easy-access--struct-accessor-cache (make-hash-table :test 'equal)
   "Memoisation table for struct-slot accessor lookup.
-Keys are cons cells (STRUCT-TYPE . :FIELD), values are the
-generated accessor function symbols, or nil if no such slot exists.")
+Keys are cons cells (STRUCT-TYPE . FIELD); values are the accessor
+function symbol, or the sentinel `easy-access--no-slot' when the
+slot does not exist.  Never stores nil — that would be
+indistinguishable from a cache miss at `gethash' time.")
+
+(defconst easy-access--no-slot (make-symbol "easy-access--no-slot")
+  "Sentinel stored in `easy-access--struct-accessor-cache' for missing slots.
+Distinct from nil so that a cached negative result is a real cache
+hit rather than a `gethash' miss.")
 
 (defun easy-access--struct-accessor (struct-type key)
   "Return the accessor function for KEY on STRUCT-TYPE, or nil.
 STRUCT-TYPE is the symbol naming a `cl-defstruct' type; KEY is
 either a keyword (`:jira' for slot `jira') or a plain symbol
 (`jira' for slot `jira').  Results are memoised in
-`easy-access--struct-accessor-cache'."
-  (let ((cache-key (cons struct-type key)))
-    (if-let ((cached (gethash cache-key easy-access--struct-accessor-cache 'miss)))
-        (if (eq cached 'miss)
-            ;; Compute and cache.  Strip the leading colon only for
-            ;; keywords; plain symbols name the slot directly.
-            (let* ((slot-name (if (keywordp key)
-                                  (intern (substring (symbol-name key) 1))
-                                key))
-                   (slots (cl-struct-slot-info struct-type))
-                   (has-slot (cl-some (lambda (slot) (eq (car slot) slot-name))
-                                      slots))
-                   (accessor (and has-slot
-                                  (intern (format "%s-%s"
-                                                  struct-type
-                                                  slot-name)))))
-              (puthash cache-key (or accessor nil)
-                       easy-access--struct-accessor-cache)
-              accessor)
-          cached)
-      nil)))
+`easy-access--struct-accessor-cache'; both hits (accessor symbol)
+and misses (no such slot) are cached exactly once."
+  (let* ((cache-key (cons struct-type key))
+         (cached (gethash cache-key easy-access--struct-accessor-cache
+                          easy-access--no-slot)))
+    (cond
+     ((eq cached easy-access--no-slot)
+      ;; Not yet computed — derive, cache, and return.
+      (let* ((slot-name (easy-access--key-to-slot-name key))
+             (slots (cl-struct-slot-info struct-type))
+             (has-slot (cl-some (lambda (slot) (eq (car slot) slot-name))
+                                slots))
+             (accessor (and has-slot
+                            (intern (format "%s-%s" struct-type slot-name)))))
+        (puthash cache-key (or accessor 'easy-access--missing-slot)
+                 easy-access--struct-accessor-cache)
+        accessor))
+     ((eq cached 'easy-access--missing-slot) nil)
+     (t cached))))
+
+(defun easy-access--key-to-slot-name (key)
+  "Return the slot symbol for KEY.
+Strips the leading colon from keywords; plain symbols pass through."
+  (if (keywordp key)
+      (intern (substring (symbol-name key) 1))
+    key))
 
 (defun easy-access--struct-get (target key)
   "Read KEY (keyword or plain symbol) from struct TARGET.
@@ -356,10 +365,10 @@ Routes through the memoised `easy-access--struct-accessor'."
 (defun easy-access--struct-set (target key value)
   "Write VALUE at KEY (keyword or plain symbol) of struct TARGET.
 Uses `cl-struct-slot-value' as an `setf'-able place."
-  (let ((slot-name (if (keywordp key)
-                       (intern (substring (symbol-name key) 1))
-                     key)))
-    (setf (cl-struct-slot-value (aref target 0) slot-name target) value)))
+  (setf (cl-struct-slot-value (aref target 0)
+                              (easy-access--key-to-slot-name key)
+                              target)
+        value))
 
 (defun easy-access--plist-set (target key value)
   "Write VALUE at KEY in plist TARGET in place (where possible).
@@ -369,13 +378,15 @@ the surrounding `setf' machinery, not here."
   (plist-put target key value)
   value)
 
-(defun easy-access--alist-set (target key value)
+(defun easy-access--alist-set (target key value &optional testfn)
   "Write VALUE at KEY in alist TARGET.
-Mutates the existing pair's cdr when present, otherwise nconcs a
-new pair on.  Non-empty alists stay consistent with the outer
-`setf' place; a fresh empty alist needs the variable rebound,
-which the gv-setter does not do -- documented sharp edge."
-  (let ((pair (assq key target)))
+TESTFN is the equality predicate, defaulting to `eq' (for symbol
+and keyword keys).  Pass `equal' for string keys.  Mutates the
+existing pair's cdr when present, otherwise nconcs a new pair on.
+Non-empty alists stay consistent with the outer `setf' place; a
+fresh empty alist needs the variable rebound, which the gv-setter
+does not do -- documented sharp edge."
+  (let ((pair (assoc key target (or testfn #'eq))))
     (if pair
         (setcdr pair value)
       (nconc target (list (cons key value))))
@@ -593,12 +604,12 @@ clobbering a non-existent index has no sensible meaning."
                (elt target idx))))
        (t (signal 'easy-access-invalid-key (list head target))))))))
 
-(defcall keywords-as-accessors (head target &optional value)
-  :when (keywordp head)
-  "Keywords in CAR position look up by association; `setf'-able.
+(defun easy-access--associative-dispatch (head target value)
+  "Shared body for symbol-keyed accessor rules.
 Dispatches to struct slots, alist pairs, hash-table entries, or
-plist cells -- in that order.  Alist detection uses the \"CAR is
-a cons cell\" heuristic."
+plist cells -- in that order.  Called by both `keywords-as-accessors'
+and `quoted-symbols-as-accessors', which share identical target-shape
+logic and differ only in their `:when' guards."
   (cond
    ((and (recordp target)
          (easy-access--struct-accessor (aref target 0) head))
@@ -618,6 +629,14 @@ a cons cell\" heuristic."
         (easy-access--plist-set target head value)
       (plist-get target head)))
    (t (signal 'easy-access-invalid-key (list head target)))))
+
+(defcall keywords-as-accessors (head target &optional value)
+  :when (keywordp head)
+  "Keywords in CAR position look up by association; `setf'-able.
+Dispatches to struct slots, alist pairs, hash-table entries, or
+plist cells -- in that order.  Alist detection uses the \"CAR is
+a cons cell\" heuristic."
+  (easy-access--associative-dispatch head target value))
 
 (defcall quoted-symbols-as-accessors (head target &optional value)
   :when (and (symbolp head) (not (keywordp head))
@@ -628,36 +647,13 @@ plain-symbol key; `setf'-able.  The `:read-key' canonicalises the
 CAR from `(quote custom-group)' to `custom-group' before it
 reaches the body or the runtime guard.  The guard then tests for
 a plain (non-keyword, non-nil, non-t) symbol -- the canonical
-shape of a quoted-symbol accessor key.  Body is the same shape as
-`keywords-as-accessors'."
-  (cond
-   ((and (recordp target)
-         (easy-access--struct-accessor (aref target 0) head))
-    (if (easy-access-setting-p)
-        (easy-access--struct-set target head value)
-      (easy-access--struct-get target head)))
-   ((easy-access--alistp target)
-    (if (easy-access-setting-p)
-        (easy-access--alist-set target head value)
-      (cdr (assq head target))))
-   ((hash-table-p target)
-    (if (easy-access-setting-p)
-        (puthash head value target)
-      (gethash head target)))
-   ((listp target)
-    (if (easy-access-setting-p)
-        (easy-access--plist-set target head value)
-      (plist-get target head)))
-   (t (signal 'easy-access-invalid-key (list head target)))))
+shape of a quoted-symbol accessor key."
+  (easy-access--associative-dispatch head target value))
 
 (defun easy-access--alist-set-equal (target key value)
   "Like `easy-access--alist-set' but compares via `equal', not `eq'.
 Needed for string keys where `assq' would miss the pair."
-  (let ((pair (assoc key target)))
-    (if pair
-        (setcdr pair value)
-      (nconc target (list (cons key value))))
-    value))
+  (easy-access--alist-set target key value #'equal))
 
 (defcall strings-as-accessors (head target &optional value)
   :when (stringp head)
@@ -692,14 +688,7 @@ heuristic as keywords — anything else that is a list is a plist."
 ;;; rewritten form is a no-op, so multiple hook points can coexist without
 ;;; double-rewriting.
 
-(defvar easy-access--walk-skip-cars
-  '(quote)
-  "CAR symbols whose args are data, not code -- walker skips them entirely.
-Note: `function' used to be here but is now handled explicitly in
-the walker to distinguish `#'SYMBOL' (data) from `#'(lambda ...)'
-(contains code).")
-
-(defvar easy-access--gv-macros
+(defconst easy-access--gv-macros
   '(setf setq cl-setf psetf psetq
     push pop cl-pushnew cl-callf cl-callf2
     cl-letf cl-letf*
